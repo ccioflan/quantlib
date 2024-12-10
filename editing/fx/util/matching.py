@@ -3,6 +3,7 @@
 #
 # Author(s):
 # Georg Rutishauser <georgr@iis.ee.ethz.ch>
+# Yifan Bao <yifbao@student.ethz.ch>
 #
 # Copyright (c) 2020-2021 ETH Zurich.
 #
@@ -43,6 +44,12 @@ class SequentialMatcher:
         self.pattern_anchor = next(iter(reversed(self.p.graph.nodes)))
         # this will be the graph module that we search for the pattern
         self.searched_gm : fx.GraphModule = None
+
+        self.pattern = pattern
+
+        # print("in sequential matcher, pattern is", pattern)
+        # print(f"pattern graph has {len(self.p.graph.nodes)} nodes")
+        # print(f"pattern graph is {self.p.graph.print_tabular()}")
 
     @property
     def searched_modules(self):
@@ -141,6 +148,12 @@ class SequentialMatcher:
                     for k, n in m.nodes_map.items():
                         if k.op not in ("placeholder", "output"):
                             matched_nodes.add(n)
+
+        # if len(self.pattern) == 2:
+        #     from quantlib.algorithms.pact.pact_ops import PACTRMSNorm
+        #     if isinstance(self.pattern[0], PACTRMSNorm):
+        #         import IPython; IPython.embed()
+        
         return all_matches
 
 def get_ordered_active_nodes(m : Match):

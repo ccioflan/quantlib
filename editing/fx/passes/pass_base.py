@@ -4,6 +4,7 @@
 # Author(s):
 # Georg Rutishauser <georgr@iis.ee.ethz.ch>
 # Moritz Scherer <scheremo@iis.ee.ethz.ch>
+# Yifan Bao <yifbao@student.ethz.ch>
 #
 # Copyright (c) 2020-2021 ETH Zurich.
 #
@@ -375,17 +376,34 @@ class ReplaceSequentialPatternPass(SequentialPass):
         self.matcher = SequentialMatcher(pattern, trace)
         self.replacement_fn = replacement_fn
         self.name = name
-        self.kwargs = kwargs
+        self.kwargs = kwargs        
+        
+        # if self.replacement_fn is masksoftmax_replacement_fun:
+        #     print(self.matcher)
+        #     exit()
+        # if name == "PACTIFIED_RELU":
+        #     print("in PACTIFIED_RELU")
+
+        #     print(self.matcher)
+        #     exit()
 
     def retarget(self, gm : fx.GraphModule):
         # to retarget to a new graph, clear all registered subpasses.
         for k in self.named_subpasses().keys():
             self.remove_subpass(k)
         self.matches = self.matcher.match_graph(gm)
+        from quantlib.editing.fx.passes.pact.harmonize import masksoftmax_replacement_fun
+        # if self.replacement_fn is masksoftmax_replacement_fun:
+        #     print(self.matches)
+        #     exit()
         passes = []
         for i, m in enumerate(self.matches):
             replacement_module = self.replacement_fn(gm, m, **self.kwargs)
             passes.append(ReplaceMatchWithModulePass(m, replacement_module, f"{self.name}_{i}"))
+            # if self.name == "PACTIFIED_RELU":
+            #     print("did replace PACTIFIED_RELU")
+
+            #     exit()
 
         self.setup_passes(passes)
 
@@ -436,7 +454,7 @@ class ModularizeNodePass(FxPass):
 
         gm.add_submodule(self.new_target, self.module)
         with gm.graph.inserting_before(self.node):
-            new_node = gm.graph.call_module(self.new_target, args=self.node.args, kwargs=self.node_kwargs)
+            new_node = gm.graph.call_module(self.new_target, args=self.node_args, kwargs=self.node_kwargs)
 
         if self.node.op == 'call_module':
             gm.delete_submodule(self.node.target)

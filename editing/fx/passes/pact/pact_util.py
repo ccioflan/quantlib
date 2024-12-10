@@ -4,6 +4,7 @@
 # Author(s):
 # Georg Rutishauser <georgr@iis.ee.ethz.ch>
 # Moritz Scherer <scheremo@iis.ee.ethz.ch>
+# Yifan Bao <yifbao@student.ethz.ch>
 #
 # Copyright (c) 2020-2021 ETH Zurich.
 #
@@ -42,12 +43,15 @@ PACT_OPS = set([_PACTActivation,
                 PACTIntegerITAPartialMax,
                 PACTGELU,
                 PACTLayerNorm,
+                PACTRMSNorm,
                 PACTIntegerSoftmax,
                 PACTIntegerGELU,
                 PACTIntegerLayerNorm,
+                PACTIntegerRMSNorm,
                 PACTEmbedding,
                 PACTWrapModule,
                 PACTHardsigmoid,
+                PACTHardGLU,
                 PACTHardswish,
                 PACTIntegerHardsigmoid,
                 PACTIntegerHardswish,
@@ -59,7 +63,8 @@ PACT_OPS = set([_PACTActivation,
                 PACTExp,
                 PACTIntegerExp,
                 Multiply,
-                ChannelwiseThreshold])
+                ChannelwiseThreshold,
+                PACTMaskSoftmax])
 
 #TODO is this still reasonable??
 PACT_OPS_INT = set([PACTIntegerAdd,

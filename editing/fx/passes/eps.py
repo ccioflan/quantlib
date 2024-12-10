@@ -4,6 +4,7 @@
 # Author(s):
 # Georg Rutishauser <georgr@iis.ee.ethz.ch>
 # Moritz Scherer <scheremo@iis.ee.ethz.ch>
+# Yifan Bao <yifbao@student.ethz.ch>
 #
 # Copyright (c) 2020-2021 ETH Zurich.
 #
@@ -21,7 +22,7 @@
 #
 
 import copy
-from typing import Union, Optional
+from typing import Union, Optional, List
 from dataclasses import dataclass
 
 from collections.abc import Iterable
@@ -52,7 +53,8 @@ def eps_conversion_pact_acts(m : nn.Module, eps_in : torch.Tensor):
     return m.get_eps().type_as(eps_in)
 
 def eps_conversion_invalid(m : nn.Module, *eps_in : torch.Tensor, **kw_eps_in : torch.Tensor):
-    assert False, f"Module class: {type(m)} does not have a valid epsilon conversion!"
+    return torch.tensor([1.0])
+    # assert False, f"Module class: {type(m)} does not have a valid epsilon conversion!"
 
 def eps_conversion_pact_gelu(m : nn.Module, eps_in : torch.Tensor):
     return m.get_eps_out(eps_in).type_as(eps_in)
@@ -66,6 +68,9 @@ def eps_conversion_matmul(*eps_ins):
 def eps_conversion_pact_softmax(m : nn.Module, eps_in : torch.Tensor):
     return torch.Tensor((1./(m.n_levels-1.),)).type_as(eps_in)
 
+def eps_conversion_pact_masksoftmax(m : nn.Module, *eps_ins, **kwargs):
+    return torch.Tensor((1./(m.n_levels-1.),)).type_as(eps_ins[0])
+
 def eps_conversion_pact_layernorm(m : nn.Module, eps_in : torch.Tensor):
     return m.get_eps_out(eps_in).type_as(eps_in)
 
@@ -73,6 +78,12 @@ def eps_conversion_identity(*eps_ins):
     return eps_ins[0]
 
 def eps_conversion_truediv(m : nn.Module, *eps_ins, **kwargs):
+    # print(eps_ins[0].shape)
+    # print(eps_ins[1])
+    # print("in eps_conversion_truediv")
+    # print(eps_ins[0].shape)
+    # print(eps_ins[1].shape)
+    # print(eps_ins[1])
     return m.get_eps_out(eps_ins[0], eps_ins[1]).type_as(eps_ins[0])
 
 def eps_conversion_pact_mean(m : nn.Module, *eps_ins, **kwargs):
@@ -88,7 +99,10 @@ def eps_conversion_embedding(m : nn.Module, eps_in : torch.Tensor):
     return m.adder.act_out.get_eps().type_as(eps_in)
 
 def eps_conversion_PACTWrapModule(m : nn.Module, *eps_in):
-    return m.statTracker.get_eps()
+    if m.quantize:
+        return m.statTracker.get_eps()
+    else:
+        return eps_in[0]
 
 def eps_conversion_mul(m : nn.Module, *eps_in):
     return eps_in[0] * eps_in[1].type_as(eps_in[0])
@@ -105,7 +119,7 @@ _EPS_CONVERSIONS = {
     '_CALL_METHOD_view' : eps_conversion_identity,
 
     f'_CALL_FUNCTION_{repr(getattr)}' : eps_conversion_first_in,
-    f'_CALL_FUNCTION_{repr(operator.getitem)}' : eps_conversion_first_in,
+    f'_CALL_FUNCTION_{repr(operator.getitem)}' : eps_conversion_identity,
     f'_CALL_FUNCTION_{repr(operator.matmul)}' : eps_conversion_matmul,
     f'_CALL_FUNCTION_{repr(torch.bmm)}' : eps_conversion_matmul,
     f'_CALL_FUNCTION_{repr(torch.matmul)}' : eps_conversion_matmul,
@@ -131,18 +145,23 @@ _EPS_CONVERSIONS = {
     PACTEmbedding : eps_conversion_embedding,
     PACTGELU : eps_conversion_pact_gelu,
     # The hardswish/hardsigmoid activations behave like linears
+    PACTHardGLU : eps_conversion_pact_linears,
     PACTHardsigmoid : eps_conversion_pact_linears,
     PACTHardswish : eps_conversion_pact_linears,
     PACTITAMax: eps_conversion_pact_softmax,
     PACTITAPartialMax: eps_conversion_pact_softmax,
     PACTLayerNorm : eps_conversion_pact_layernorm,
+    PACTRMSNorm : eps_conversion_pact_layernorm,
     PACTMean: eps_conversion_pact_mean,
     PACTSoftmax : eps_conversion_pact_softmax,
     PACTUnsignedAct : eps_conversion_pact_acts,
     PACTWrapModule : eps_conversion_PACTWrapModule,
     PACTLinear : eps_conversion_pact_linears,
+    PACTMaskSoftmax : eps_conversion_pact_masksoftmax,
 
     PACTIntegerAdd : eps_conversion_pact_integeradd,
+    PACTIntegerAddMask : eps_conversion_pact_integeradd,
+    PACTIntegerConcat : eps_conversion_pact_integeradd,
     PACTIntegerGELU : eps_conversion_pact_gelu,
     PACTIntegerITAMax: eps_conversion_pact_softmax,
     PACTIntegerITAPartialMax: eps_conversion_pact_softmax,
@@ -201,12 +220,14 @@ _N_LEVELS_OUT_PROP = {
     PACTITAMax: n_levels_out_pact_acts,
     PACTITAPartialMax: n_levels_out_pact_acts,
     PACTLayerNorm : n_levels_out_pact_acts,
+    PACTRMSNorm : n_levels_out_pact_acts,
     PACTLinear : n_levels_out_pact_linears,
     PACTMean: n_levels_out_first_in,
     PACTSoftmax : n_levels_out_pact_acts,
     PACTUnsignedAct : n_levels_out_pact_acts,
     PACTWrapModule : n_levels_out_pact_acts,
-    
+    PACTMaskSoftmax : n_levels_out_pact_acts,
+
     PACTIntegerGELU : n_levels_out_pact_acts,
     PACTIntegerITAMax: n_levels_out_pact_acts,
     PACTIntegerITAPartialMax: n_levels_out_pact_acts,
@@ -219,7 +240,7 @@ always_signed = lambda m, si: True
 always_unsigned = lambda m, si: False
 
 def signed_out_pact_wrap(m : nn.Module, si : list):
-    return _SIGNED_OUT_PROP[type(m.Module)](m.module, si)
+    return _SIGNED_OUT_PROP[type(m.module)](m.module, si)
 
 def signed_out_or_in_signed(m : nn.Module, si : list):
     out_signed = False
@@ -238,7 +259,7 @@ _SIGNED_OUT_PROP = {
     '_CALL_METHOD_reshape' : signed_out_first_in,
     '_CALL_METHOD_transpose' : signed_out_first_in,
     '_CALL_METHOD_view' : signed_out_first_in,
-    
+
     f'_CALL_FUNCTION_{repr(getattr)}' : signed_out_first_in,
     f'_CALL_FUNCTION_{repr(operator.add)}' : signed_out_or_in_signed,
     f'_CALL_FUNCTION_{repr(operator.getitem)}' : signed_out_first_in,
@@ -270,6 +291,7 @@ _SIGNED_OUT_PROP = {
     PACTGELU : always_signed,
     PACTITAMax: always_unsigned,
 
+    PACTMaskSoftmax: always_unsigned,
     PACTITAPartialMax: always_unsigned,
     PACTLinear : always_signed,
     PACTMean: signed_out_or_in_signed,
@@ -279,6 +301,7 @@ _SIGNED_OUT_PROP = {
     PACTLayerNorm: always_signed,
 
     PACTIntegerAdd : signed_out_or_in_signed,
+    PACTIntegerAddMask : signed_out_or_in_signed,
     PACTIntegerGELU : always_signed,
     PACTIntegerITAMax: always_unsigned,
     PACTIntegerITAPartialMax: always_unsigned,
@@ -333,6 +356,18 @@ class AnnotateEpsPass(FxPass):
         self.prop_n_levels = prop_n_levels
         self.prop_sign = prop_sign
 
+    @staticmethod
+    def _get_parents_eps_out(node: fx.node.Node) -> List:
+        return [i.meta['quant'].eps_out[0] for i in node.args[0]]
+
+    @staticmethod
+    def _get_parents_n_levels_out(node: fx.node.Node) -> List:
+        return [i.meta['quant'].n_levels_out for i in node.args[0]]
+
+    @staticmethod
+    def _get_parents_signed_out(node: fx.node.Node) -> List:
+        return [inp.meta['quant'].signed_out for inp in node.args[0]]
+
     def run_pass(self, gm : fx.GraphModule):
         modules = gm_modules(gm)
         placeHolderIdx = 0
@@ -365,7 +400,12 @@ class AnnotateEpsPass(FxPass):
                     m = None
 
                 if self.prop_eps:
+                    # print(f"{node.name}, {node.op}, {node.target}")
                     arg_eps_ins = [i.meta['quant'].eps_out for i in node.args if isinstance(i, fx.Node)]
+                    # if k == f'_CALL_FUNCTION_{repr(operator.getitem)}':
+                    #     print(f"getiitem arg_eps_ins is : {arg_eps_ins}")
+                    #     for i in node.args:
+                    #         print(f"Node arg : {i}")
                     other_args = [i for i in node.args if not isinstance(i, fx.Node)]
 
                     kwarg_eps_ins = {k : v.meta['quant'].eps_out for k, v in node.kwargs.items() if isinstance(v, fx.Node)}
@@ -380,15 +420,49 @@ class AnnotateEpsPass(FxPass):
                         conversion_args = arg_eps_ins
 
                     try:
+                        # print(f"Key: {k}")
+                        
+                        # print("Conversion args")
+                        # print(conversion_args)
+                        # print(conversion_kwargs)
+                        # for val in arg_eps_ins:
+                        #     print(val.shape)
+                        
+                        if k == PACTDiv:
+                            # print(conversion_args)
+                            # constant value as second parameter of div
+                            # set eps 1.0
+                            # print("in div eps conversion")
+                            # print()
+                            if(type(other_args[0]) == int):
+                                conversion_args = [m] + arg_eps_ins + [torch.tensor(1.0)]
+                                # print(conversion_args)
+                        # if k == PACTDiv:
+                        #     print(len(conversion_args))
                         eps_out = _EPS_CONVERSIONS[k](*conversion_args, **conversion_kwargs)
+                        # if k == f'_CALL_FUNCTION_{repr(operator.getitem)}':
+                        #     print(f"getiitem eps_out is : {eps_out}")
+                        #     print(f"getitem conversion_args : {conversion_args}")
+                        #     print(f"getitem conversion_kwargs : {conversion_kwargs}")
                     except KeyError:
-                        if (self.verbose): 
+                        if (self.verbose):
                             print(f"[AnnotateEpsPass] Key {k} not found in _EPS_CONVERSIONS!")
+                        # print("all_eps:", all_eps)
+                        # if not all(isinstance(e, torch.Tensor) for e in all_eps):
+                        #     print("Error: all_eps contains non-Tensor elements.")
+                        #     for e in all_eps:
+                        #         print(f"Element: {e}, Type: {type(e)}")
+                        #     raise TypeError("all_eps must contain only Tensors.")
+
                         eps_diffs = [torch.abs(e1 - e2) for e1, e2 in zip(all_eps[:-1], all_eps[1:])]
                         if not all(d < 1e-8 for d in eps_diffs):
                             print("[AnnotateEpsPass] Mismatching input epsilons in node with no eps propagation function! Eps propagation will likely be wrong!")
                             print(f"                    -> Node: {node.name}, Key: {k}, eps_in: {all_eps}")
                             if (self.verbose): print(f"[AnnotateEpsPass] Using identity epsilon propagation on node with op {node.op}, target {node.target}!")
+
+                        if node.op == "call_function" and node.target == torch.cat:
+                            all_eps = self._get_parents_eps_out(node)
+
                         eps_out = all_eps[0]
                 else:
                     eps_in = None
@@ -399,13 +473,17 @@ class AnnotateEpsPass(FxPass):
                     try:
                         node_out_levels = _N_LEVELS_OUT_PROP[k](m, node_in_levels, self.accumulator_levels)
                     except KeyError:
-                        if (self.verbose): 
+                        if (self.verbose):
                             print(f"[AnnotateEpsPass] Key {k} not found in _N_LEVELS_OUT_PROP!")
                         in_levels_diffs = [abs(l1 - l2) for l1, l2 in zip(node_in_levels[:-1], node_in_levels[1:])]
                         if not all(d < 1e-8 for d in in_levels_diffs):
                             print("[AnnotateEpsPass] Mismatching input n_levels in node with no n_levels_out propagation function! n_levels propagation will likely be wrong!")
                             print(f"                    -> Node: {node.name}, Key: {k}, n_levels_in: {node_in_levels}")
                             if (self.verbose): print(f"[AnnotateEpsPass] Using identity n_level propagation on node with op {node.op}, target {node.target}!")
+
+                        if node.op == "call_function" and node.target == torch.cat:
+                            node_in_levels = self._get_parents_n_levels_out(node)
+
                         node_out_levels = node_in_levels[0]
                 else:
                     node_in_levels = None
@@ -417,13 +495,17 @@ class AnnotateEpsPass(FxPass):
                     try:
                         node_out_signed = _SIGNED_OUT_PROP[k](m, node_in_signed)
                     except KeyError:
-                        if (self.verbose): 
+                        if (self.verbose):
                             print(f"[AnnotateEpsPass] Key {k} not found in _SIGNED_OUT_PROP!")
                         in_singed_diffs = [abs(s1 - s2) for s1, s2 in zip(node_in_signed[:-1], node_in_signed[1:])]
                         if not all(d < 1e-8 for d in in_singed_diffs):
                             print("[AnnotateEpsPass] Mismatching input signedness in node with no signedness propagation function! signedness propagation will likely be wrong!")
                             print(f"                    -> Node: {node.name}, Key: : {k}, signed_in: {node_in_signed}")
                             if (self.verbose): print(f"[AnnotateEpsPass] Using identity signed propagation on node with op {node.op}, target {node.target}!")
+
+                        if node.op == "call_function" and node.target == torch.cat:
+                            node_in_signed = self._get_parents_signed_out(node)
+
                         node_out_signed = node_in_signed[0]
                 else:
                     node_in_signed = None

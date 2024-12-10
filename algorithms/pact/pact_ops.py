@@ -6,6 +6,7 @@
 # Georg Rutishauser <georgr@iis.ee.ethz.ch>
 # Moritz Scherer <scheremo@iis.ee.ethz.ch>
 # Philip Wiese <wiesep@student.ethz.ch>
+# Yifan Bao <yifbao@student.ethz.ch>
 #
 # Copyright (c) 2020-2021 ETH Zurich.
 #
@@ -31,6 +32,7 @@ from typing import Literal, Optional, Union
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.fx
 from torch.onnx import register_custom_op_symbolic
 from torch.onnx.symbolic_helper import parse_args
@@ -61,6 +63,7 @@ __all__ = [
     'PACTQuantize',
     'TQTQuantize',
     'PACTIntegerAdd',
+    'PACTIntegerAddMask',
     'PACTIntegerConcat',
     'PACTIntegerMatmul',
     'PACTIntegerSoftmax',
@@ -73,6 +76,8 @@ __all__ = [
     'PACTIntegerITAPartialMax',
     'PACTGELU',
     'PACTLayerNorm',
+    'PACTRMSNorm',
+    'PACTIntegerRMSNorm',
     'PACTIntegerEmbedding',
     'PACTEmbedding',
     'PACTWrapModule',
@@ -83,15 +88,20 @@ __all__ = [
     'HardActRequantShift',
     'PACTHardswish',
     'PACTHardsigmoid',
+    'PACTHardGLU',
     'PACTIntegerHardswish',
     'PACTIntegerHardsigmoid',
     'PACTMean',
     'PACTIntegerMean',
     'PACTDiv',
     'PACTIntegerDiv',
+    'PACTTrueIntegerDiv',
     'PACTExp',
     'PACTIntegerExp',
-    'ChannelwiseThreshold'
+    'ChannelwiseThreshold',
+    'PACTMaskSoftmax',
+    'PACTIntegerMaskSoftmax',
+    'PACTIntegerHardGLU'
 ]
 
 class RequantShift(nn.Module):
@@ -117,17 +127,17 @@ class RequantShift(nn.Module):
 
             if not signed:
             # if unsigned: clip y to interval (0, n_levels-1)
-                y_tilde =  torch.clip(y, min=torch.zeros(1).type_as(x), max=(n_levels_out-1).type_as(x))
+                y_tilde =  torch.clip(y, min=torch.zeros(1), max=(n_levels_out-1))
                 return y_tilde
             else:
             # if signed: clip y to interval (-n_levels/2, n_levels/2-1)
-                c = torch.round(n_levels_out/2. + 0.001)
+                c = torch.round(n_levels_out/2. + 0.001).type_as(y)
                 # to get correct operators in the exported graph, type_as(x)
                 # must be the last thing called on a tensor before feeding into
                 # the clip operator. Otherwise, it may get exported as
                 # min(max(..)) or some other weirdness
-                lo = (c * -1).type_as(y)
-                hi = (c-1).type_as(y)
+                lo = (c * -1)
+                hi = (c-1)
 
                 y_tilde = torch.clip(y, min=lo, max=hi)
                 return y_tilde
@@ -135,7 +145,7 @@ class RequantShift(nn.Module):
         @staticmethod
         @parse_args('v', 'v', 'v', 't', 't', 't', 't')
         def symbolic(g, x, mul, add, div, signed, n_levels_out, cmsis_requant):
-            signed = torch.Tensor((signed,)).type_as(div)
+            signed = torch.Tensor((signed,))
             div_ = g.op("Constant", value_t=div)
             signed_ = g.op("Constant", value_t=signed)
             n_levels_out_ = g.op("Constant", value_t=n_levels_out)
@@ -170,13 +180,13 @@ class RequantShift(nn.Module):
         if len(self.add.shape) == 1:
             add = self.add.reshape([-1]+[1]*(len(x.shape)-2))
 
-        if torch.equal(mul.type_as(x), self.div.type_as(x)) and torch.equal(add.type_as(x), torch.Tensor((0.,)).type_as(x)):
-            return x
+        # if torch.equal(mul.type_as(x), self.div.type_as(x)) and torch.equal(add.type_as(x), torch.Tensor((0.,)).type_as(x)):
+        #     return x
         if self.requant_node:
-            return self.MyRequantShift.apply(x, mul.type_as(x), add.type_as(x), self.div.type_as(x), self.signed, self.n_levels_out.type_as(x), self.cmsis_requant)
+            return self.MyRequantShift.apply(x, mul, add, self.div, self.signed, self.n_levels_out, self.cmsis_requant)
         else:
             # calling `forward` directly does not trigger the symbolic export
-            return self.MyRequantShift.forward(None, x, mul.type_as(x), add.type_as(x), self.div.type_as(x), self.signed, self.n_levels_out, self.cmsis_requant)
+            return self.MyRequantShift.forward(None, x, mul, add, self.div, self.signed, self.n_levels_out, self.cmsis_requant)
 
 class HardActRequantShift(nn.Module):
     #def __init__(self, gamma_h : torch.Tensor, beta_h : torch.Tensor, three :
@@ -415,6 +425,14 @@ class _PACTActivation(nn.Module):
             self.truemin          = torch.nn.Parameter(torch.Tensor((min_init,)), requires_grad=False)
             self.register_buffer('ready', torch.tensor(False))
 
+    def resetHistogram(self):
+        if self.init_clip == "percentile":
+            self.histogram[:] = torch.zeros_like(self.histogram)
+            self.prevEdges[:] = torch.zeros_like(self.prevEdges)
+            self.truemax[:] = 1
+            min_init = -1. if self.signed else 0.
+            self.truemin[:] = min_init
+
     # SCHEREMO: Assume self.histogram magnitude list of data, binned
     def updateHistogram(self, stat):
         if self.init_clip != "percentile":
@@ -434,6 +452,9 @@ class _PACTActivation(nn.Module):
             return newHistogram
 
         with torch.no_grad():
+            # Get stat without infinities
+            stat = stat[torch.isfinite(stat)]
+
             # SCHEREMO: get min and max
             newTruemax = max(self.truemax.item(), stat.max())
             newTruemin = min(self.truemin.item(), stat.min())
@@ -477,6 +498,9 @@ class _PACTActivation(nn.Module):
         return r
 
     def forward(self, x):
+        if x.numel() == 0:
+            return x
+
         if not self.started:
             if self.act_kind == 'identity':
                 res =  x
@@ -533,6 +557,15 @@ class _PACTActivation(nn.Module):
                 result = PACTQuantize(x, eps, self.clip_lo, clip_upper, floor=(not self.rounding), clip_gradient=self.clip_gradient, noisy=self.noisy)
             if isinstance(result, QTensor):
                 result.eps = eps
+
+            # WIESEP: Propagate -inf values
+            result[x == torch.finfo(x.dtype).min] = -torch.inf
+
+            x_stat = torch.tensor(result, device=self.max.device, dtype=self.max.dtype) if not isinstance(result, torch.Tensor) else result
+            # import IPython; IPython.embed()
+
+            self.updateHistogram(x_stat)
+
             return result
 
 
@@ -581,11 +614,15 @@ class PACTIntegerConcat(torch.nn.Module):
         self.acts = torch.nn.ModuleList([])
         for i in range(num_args):
             self.acts.append(act_cls(**kwargs))
+        self.act_out = act_cls(**kwargs)
 
         self.clip_lo = self.acts[0].clip_lo
         self.clip_hi = self.acts[0].clip_hi
         self.n_levels = self.acts[0].n_levels
-        self.force_out_eps = force_out_eps
+        if "force_out_eps" in kwargs.keys():
+            self.force_out_eps = kwargs['force_out_eps']
+        else:
+            self.force_out_eps = True
 
     def reassign_epsilons(self):
         if not self.force_out_eps:
@@ -598,31 +635,21 @@ class PACTIntegerConcat(torch.nn.Module):
                     max_clip = i.clip_hi.data
                     min_clip = i.clip_lo.data
                     diff = max_clip - min_clip
-                    #print(diff)
                     eps = diff/(self.n_levels-1)
 
-            # SCHEREMO: This is the part that I might have to think about a bit more...
-            for i in self.acts:
-                # Closer to unsigned than to signed -- Is this reasonable?
-                #if abs(i.clip_lo) < abs(i.clip_hi)/2:
-                # Make it unsigned if it is only really barely signed... 5 is really arbitrary, though
-                if abs(i.clip_lo) < i.get_eps():
-                    i.symm = False
-                    i.clip_hi.data.copy_(torch.Tensor((eps * (self.n_levels-1),)))
-                    i.clip_lo.data.copy_(torch.Tensor((0.,)))
-                    # Closer to signed than unsigned
-                else:
-                    i.symm = True
-                    i.clip_lo.data.copy_(torch.Tensor((-(self.n_levels/2)*eps,)))
-                    i.clip_hi.data.copy_(torch.Tensor(((self.n_levels/2 - 1)*eps,)))
-#                     i.clip_lo.data.copy_(lower_bound)
-#                     i.clip_hi.data.copy_(upper_bound)
         else:
             clip_hi = self.act_out.clip_hi.data.detach().clone()
             clip_lo = self.act_out.clip_lo.data.detach().clone()
-            for i in self.acts:
-                i.clip_hi.data.copy_(clip_hi)
-                i.clip_lo.data.copy_(clip_lo)
+            eps = (clip_hi - clip_lo) / (self.act_out.n_levels-1)
+
+        for i in self.acts:
+            if isinstance(i, PACTUnsignedAct):
+                i.clip_hi.data.copy_(torch.Tensor((eps * (self.n_levels-1),)))
+            else:
+                i.symm = True
+                i.clip_lo.data.copy_(torch.Tensor((-(self.n_levels/2)*eps,)))
+                i.clip_hi.data.copy_(torch.Tensor(((self.n_levels/2 - 1)*eps,)))
+
 
     def forward(self, *x):
         if self.stack_flag:
@@ -633,7 +660,8 @@ class PACTIntegerConcat(torch.nn.Module):
         for idx, i in enumerate(z):
             z_act.append(self.acts[idx](i))
         y = torch.cat(z_act, dim=self.dim)
-        return y
+        out = self.act_out(y)
+        return out
 
 class PACTIntegerAdd(torch.nn.Module):
     r"""
@@ -734,6 +762,26 @@ class PACTIntegerAdd(torch.nn.Module):
             else:
                 total.eps = self.acts[0].get_eps()
         return total
+
+class PACTIntegerAddMask(PACTIntegerAdd):
+    def __init__(
+            self,
+            num_args = 1,
+            force_out_eps=False,
+            signed : Union[bool, list] = True,
+            n_levels : Union[int, list] = 256,
+            **kwargs
+    ):
+        super().__init__(num_args, force_out_eps, signed, n_levels, **kwargs)
+
+    def reassign_epsilons(self):
+        # Alays use the episolon from the first activation
+        self.act_out.clip_lo.data.copy_(self.acts[0].clip_lo.data)
+        self.act_out.clip_hi.data.copy_(self.acts[0].clip_hi.data)
+
+        for i in self.acts:
+            i.clip_lo.data.copy_(self.acts[0].clip_lo.data)
+            i.clip_hi.data.copy_(self.acts[0].clip_hi.data)
 
 
 class PACTIntegerMatmul(torch.nn.Module):
@@ -1014,7 +1062,9 @@ class PACTConv2d(nn.Conv2d, _PACTLinOp):
 
 
     def forward(self, x):
+        # print(f"PACTConv2d input has {len(torch.unique(x))} total values.")
         b = self.bias
+        # print(f"PACTConv2d bias has {len(torch.unique(b))} total values.")
         if self.started:
             w = self.weight_q
         elif self.params_frozen:
@@ -1031,10 +1081,23 @@ class PACTConv2d(nn.Conv2d, _PACTLinOp):
             padding = 0
         else:
             padding = self.padding
+
+        # print(f"before calling conv2d")
+        # print(f"PACTConv2d x has {len(torch.unique(x))} unique values.")
+        # print(f"PACTConv2d weight has {len(torch.unique(w))} unique values.")
+        # print(f"PACTConv2d bias has {len(torch.unique(b))} unique values.")
         result = nn.functional.conv2d(x, w, b, self.stride, padding, self.dilation, self.groups)
+        # print(f"after conv2d function, result has {len(torch.unique(result))} unique values.")
         if self.started and isinstance(result, QTensor) and x.eps is not None:
             result.eps = self.get_eps_out(x.eps)
 
+        # print(f"This PACTConv2d has started? {self.started}")
+        # unique_values = torch.unique(result)
+        # print(f"PACTConv2d has {len(unique_values)} unique values.")
+        # unique_values = torch.unique(w)
+        # print(f"PACTConv2d weight_q has {len(unique_values)} unique values.")
+        
+        
         return result
 
 
@@ -1230,7 +1293,7 @@ class PACTCausalConv1d(PACTConv1d, _PACTLinOp):
             dil = dilation
         self.__padding = (k-1) * dil
 
-        super(PACTCausalConv1d, self).__init__( 
+        super(PACTCausalConv1d, self).__init__(
             in_channels,
             out_channels,
             kernel_size,
@@ -1300,6 +1363,7 @@ class PACTCausalConv1d(PACTConv1d, _PACTLinOp):
 
 class PACTLinear(nn.Linear, _PACTLinOp):
     def __init__(self,
+                 ture_linear,
                  in_features : int,
                  out_features : int,
                  n_levels : int = 256,
@@ -1330,7 +1394,7 @@ class PACTLinear(nn.Linear, _PACTLinOp):
                                 tqt_beta=tqt_beta,
                                 tqt_clip_grad=tqt_clip_grad,
                                 rounding=rounding)
-
+        self.ture_linear = ture_linear
         self.register_buffer('weight_frozen', self.weight.data.clone())
         if self.bias is not None:
             self.register_buffer('bias_frozen', self.bias.data.clone())
@@ -1362,6 +1426,7 @@ class PACTLinear(nn.Linear, _PACTLinOp):
         return self.get_eps_w().flatten().type_as(eps_in)*eps_in
 
     def forward(self, x):
+        # return self.ture_linear(x)
         b = self.bias
         if self.started:
             w = self.weight_q
@@ -1383,7 +1448,7 @@ class PACTLinear(nn.Linear, _PACTLinOp):
 
     @classmethod
     def from_linear(cls, l : nn.Linear, **kwargs):
-        pact_linear = cls(in_features=l.in_features,
+        pact_linear = cls(l, in_features=l.in_features,
                           out_features=l.out_features,
                           bias=(l.bias is not None),
                           **kwargs)
@@ -1404,9 +1469,10 @@ class PACTLinear(nn.Linear, _PACTLinOp):
 class PACTHardswish(nn.Module):
     def __init__(self, eps_s : float):
         super(PACTHardswish, self).__init__()
-        self.eps_s = eps_s
+        self.eps_s = torch.Tensor([eps_s])
 
     def forward(self, x):
+        # return x * x.sigmoid()
         inp = x
         three = torch.tensor(3., dtype=x.dtype, device=x.device)
         six = 2 * three
@@ -1422,7 +1488,7 @@ class PACTHardswish(nn.Module):
         x = x + three
         x = torch.minimum(torch.maximum(z, x), six)
         # 2. /6
-        one_over_six = PACTQuantize(o/6, self.eps_s, 0., 1., floor=False)
+        one_over_six = PACTQuantize(o/6, self.eps_s.type_as(o), 0., 1., floor=False)
         x = x * one_over_six
         # 3. x * (ans)
         return inp * x
@@ -1432,8 +1498,27 @@ class PACTHardswish(nn.Module):
 
 
 class PACTIntegerHardswish(nn.Module):
-    def __init__(self, eps_in : float, eps_s : float):
+
+    class MyHardswish(torch.autograd.Function):
+
+        @staticmethod
+        def forward(ctx, x, three, six, one_over_six):
+            z = 0
+            inp = x
+            x = x + three
+            x = torch.clip(x, z, six)
+            x = x * one_over_six
+            return inp * x
+
+        @staticmethod
+        @parse_args('v', 'i', 'i', 'i')
+        def symbolic(g, x, three, six, one_over_six):
+            return g.op("PACTOps::iHardswish", x, three_i = three, six_i = six, one_over_six_i = one_over_six)
+
+    def __init__(self, eps_in : float, eps_s : float, export_node: bool = False):
         super(PACTIntegerHardswish, self).__init__()
+
+        self.export_node = export_node
         self.eps_in = eps_in
         self.eps_s = eps_s
         three = torch.tensor(3.)
@@ -1447,15 +1532,68 @@ class PACTIntegerHardswish(nn.Module):
         self.register_buffer("one_over_six", one_over_six_q)
 
     def forward(self, x):
+        if self.export_node:
+            return self.MyHardswish.apply(x, int(self.three.item()), int(self.six.item()), int(self.one_over_six.item()))
+        else:
+            return self.MyHardswish.forward(x, self.three, self.six, self.one_over_six)
+
+class PACTHardGLU(nn.Module):
+    def __init__(self, dim, eps_s : float):
+        super(PACTHardGLU, self).__init__()
+        self.dim = dim
+        self.eps_s = torch.Tensor([eps_s])
+    def _hardsigmoid_forward(self, x):
+        three = torch.tensor(3., dtype=x.dtype, device=x.device)
+        six = 2 * three
+        z = torch.zeros(1, dtype=x.dtype, device=x.device)
+        o = torch.ones(1, dtype=x.dtype, device=x.device)
+        # if we have a handle on the input epsilon, quantize the constants 3
+        # and 6 to eps_in
+        if isinstance(x, QTensor) and x.eps is not None:
+            three = PACTQuantize(three, x.eps, 2., 4., floor=False)
+            six = PACTQuantize(six, x.eps, 5., 6.5, floor=False)
+        # now perform quantized hswish with the input data:
+        # 1. relu6(x+3)
+        x = x + three
+        x = torch.minimum(torch.maximum(z, x), six)
+        # 2. /6
+        one_over_six = PACTQuantize(o/six, self.eps_s, z, o, floor=False)
+        return x * one_over_six
+    
+    def forward(self, x):
+        x_in, x_gate = x.chunk(2, dim=self.dim)
+        # return x_in * x_gate.sigmoid()
+        return x_in * self._hardsigmoid_forward(x_gate)
+    
+    def get_eps_out(self, eps_in):
+        return self.eps_s.type_as(eps_in) * eps_in
+
+class PACTIntegerHardGLU(nn.Module):
+    def __init__(self, dim, eps_in : float, eps_s : float):
+        super(PACTIntegerHardGLU, self).__init__()
+        self.dim = dim
+        self.eps_in = eps_in
+        self.eps_s = eps_s 
+        three = torch.tensor(3.)
+        six = 2 * three
+        three_q = torch.round(three/self.eps_in)
+        six_q = torch.round(six/self.eps_in)
+        self.register_buffer("three", three_q)
+        self.register_buffer("six", six_q)
+        one_over_six = 1/six
+        one_over_six_q = torch.round(one_over_six/eps_s)
+        self.register_buffer("one_over_six", one_over_six_q)
+    
+    def _integer_hardsigmoid_forward(self, x):
         z = torch.zeros.type_as(x)
         inp = x
         x = x + self.three
-        x = torch.clip(x, z, self.six)
-        x = x * self.one_over_six
-        return inp * x
-
-
-
+        x = torch.clip(x, z, self.six) 
+        return x * self.one_over_six
+        
+    def forward(self, x):
+        x_in, x_gate = x.chunk(2, dim=self.dim)
+        return x_in * self._integer_hardsigmoid_forward(x_gate)
 
 class PACTHardsigmoid(nn.Module):
     def __init__(self, eps_s : float):
@@ -1706,8 +1844,199 @@ class PACTIntegerExp(torch.nn.Module):
         else:
             return self.MyExp.forward(None, x, self.log2.type_as(x), self.coeffA.type_as(x), self.coeffB.type_as(x), self.coeffC.type_as(x), self.n_levels.type_as(x), self.zero.type_as(x))
 
+class PACTMaskSoftmax(_PACTEps):
+    def __init__(self, n_levels : int = 256, dim: int = 1, **kwargs):
+        super().__init__(True)
+        # self.started = False
+        self.n_levels = n_levels
+        self.dim = dim
+        self.register_buffer('coeffA', torch.Tensor((0.35815147,)))
+        self.register_buffer('coeffB', torch.Tensor((1.353,)))
+        self.register_buffer('coeffC',  torch.Tensor((0.344,)))
+        self.register_buffer('log2',  torch.Tensor((1.,)))
+        self.register_buffer('clip_gradient', torch.tensor(True))
+        self.register_buffer('floor', torch.tensor(False))
+    
+    def set_eps_in(self, eps_list):
+        # print(f"in PACTMaskSoftmax set_eps_in, eps_list is : {eps_list}")
+        # if eps_list[0] < 4.1839e-14:
+        #     eps_list[0] = 4.1839e-14
+        super().set_eps_in(eps_list)
+    
+    def updateCoeffs(self, eps):
+        eps2 = torch.Tensor((0.3585,)).type_as(eps)
+        self.coeffA.data[0] = torch.round(0.3585/eps2) * eps2
+        self.coeffB.data[0] = torch.round(1.353/eps) * eps
+        self.coeffC.data[0] = torch.round(0.344/(eps**2*eps2)) * eps**2*eps2
+        self.log2.data[0] = torch.round(math.log2(2)/(eps)) * eps
+    
+    def _IBERT_forward(self, x):
+        def RQ(x, eps): # Dequant?
+            if self.started:
+                x = torch.floor(x/eps+0.5)*eps
+            return x
+
+        xTilde = x - RQ(torch.max(x, -1, keepdim=True)[0], self.eps_in)
+        z = -RQ(xTilde / self.log2, torch.Tensor((1.,)).type_as(x))
+        p = xTilde + z * self.log2
+        
+        y = RQ((self.coeffA*(p + self.coeffB)**2 + self.coeffC) / 2**z, self.coeffA*self.eps_in**2)
+        ysum = torch.unsqueeze(torch.sum(y, -1), dim=-1)
+        out = RQ(y / (ysum), 1./self.n_levels)
+
+        # if torch.isnan(out).any():
+        #     print(f"torch.isnan(xTilde).any() is : {torch.isnan(xTilde).any()}")
+        #     print(f"torch.isnan(z).any() is : {torch.isnan(z).any()}")
+        #     print(f"torch.isnan(p).any() is : {torch.isnan(p).any()}")
+        #     print(f"torch.isnan(y).any() is : {torch.isnan(y).any()}")
+        #     if torch.isnan(y).any():
+        #         print(f"torch.isnan(p + self.coeffB).any() is : {torch.isnan(p + self.coeffB).any()}")
+        #         print(f"torch.isnan((p + self.coeffB)**2).any() is : {torch.isnan((p + self.coeffB)**2).any()}")
+        #         print(f"torch.isnan(self.coeffA*(p + self.coeffB)**2).any() is : {torch.isnan(self.coeffA*(p + self.coeffB)**2).any()}")
+        #         print(f"torch.isnan((self.coeffA*(p + self.coeffB)**2 + self.coeffC)).any() is : {torch.isnan((self.coeffA*(p + self.coeffB)**2 + self.coeffC)).any()}")
+        #         print(f"torch.isnan(2**z).any() is : {torch.isnan(2**z).any()}")
+        #         print(f"torch.isnan((self.coeffA*(p + self.coeffB)**2 + self.coeffC) / 2**z).any() is : {torch.isnan((self.coeffA*(p + self.coeffB)**2 + self.coeffC) / 2**z).any()}")
+        #         print(f"self.eps_in is : {self.eps_in}")
+        #         print(f"torch.isnan(self.eps_in**2) is : {self.eps_in**2}")
+        #         print(f"torch.isnan(self.coeffA*self.eps_in**2) is : {self.coeffA*self.eps_in**2}")
+        #     print(f"torch.isnan(ysum).any() is : {torch.isnan(ysum).any()}")
+        #     print(f"ysum is: {ysum}")
+        #     print(f"y is : {y}")
+        #     print(f"torch.isnan(y / (ysum)).any() is : {torch.isnan(y / (ysum)).any()}")
+        #     print(f"nlevels is : {self.n_levels}")
+        #     print(f"1./self.n_levels is : {1./self.n_levels}")
+        #     # x = torch.floor(x/eps+0.5)*eps
+        #     exit()
+        return out
+
+    def forward(self, att_scores, mask):
+        # att_scores (B, H, T, T)
+        # mask (B, 1, 1, T)
+        B, T = att_scores.size(0), att_scores.size(2)
+        probs = []
+        # in inference, only allows batch-size 1. 
+        assert B == 1, "Batch size should be 1 in inference"
+        # num_zero = 0
+        for i in range(1):
+            # (H, T, T)
+            att_score_i = att_scores[i]
+            mask_i = mask[i][0][0] 
+            num_zero = (mask_i == 0).sum().item()
+            # for val in mask_i:
+            #     if val == False:
+            #         num_zero += 1
+            # indices = torch.arange(num_zero)  
+            extracted_score = att_score_i[:, :, : num_zero]
+            IBERT_tensor = self._IBERT_forward(extracted_score) # calculate softmax
+            # IBERT_tensor = F.softmax(extracted_score, dim=-1)     
+            probs.append(F.pad(IBERT_tensor, (0, T - num_zero), 'constant', 0))
+
+        stacked_tensor = torch.stack(probs, dim=0)
+        # if torch.isnan(stacked_tensor).any():
+        #     print("nan in PACTMaskSoftmax stacked_tensor")
+        return stacked_tensor
+    
+class PACTIntegerMaskSoftmax(torch.nn.Module):
+    class MyMaskSoftmax(torch.autograd.Function):
+        @staticmethod
+        def _integer_softmax_forward(x, log2, coeffA, coeffB, coeffC, n_levels, zero):
+            xTilde = (x - torch.max(x, dim=-1, keepdim=True)[0])
+            z = torch.floor(-xTilde / log2)
+            p = xTilde + z * log2
+            y = torch.floor(((coeffA*(p + coeffB)**2 + coeffC)) // (2**z))
+            ysum = torch.sum(y, -1, keepdim=True)
+            norm = torch.floor(y*(n_levels-1)/(ysum))
+            out = torch.clip(norm, zero, n_levels-1)
+            return out
+            
+        @staticmethod
+        def forward(ctx, att_scores, mask, log2, coeffA, coeffB, coeffC, n_levels, zero):
+            B, T = att_scores.size(0), att_scores.size(2)
+            probs = []
+            # in inference, only allows batch-size 1. 
+            assert B == 1, "Batch size should be 1 in inference"
+                
+            # (H, T, T)
+            att_score_i = att_scores[0]
+            mask_i = mask[0][0][0]          
+            num_zero = (mask_i == 0).sum().item()
+            extracted_score = att_score_i[:, :, : num_zero]
+            IBERT_tensor = _integer_softmax_forward(extracted_score, log2, coeffA, coeffB, coeffC, n_levels, zero)
+            probs.append(F.pad(IBERT_tensor, (0, T - num_zero), 'constant', 0))
+            stacked_tensor = torch.stack(probs, dim=0)
+            return stacked_tensor
+                    
+        @staticmethod
+        @parse_args('v', 'v', 't', 't', 't', 't', 't', 't')
+        def symbolic(g, x, mask, log2, coeffA, coeffB, coeffC, n_levels, zero):
+            #return g.op("PACTOps::iMaskSoftmax", x, log2_f = log2, coeffA_f = coeffA, coeffB_f = coeffB, coeffC_f = coeffC, n_levels_f = n_levels)
+
+            log2_ = g.op("Constant", value_t=log2)
+            coeffA_ = g.op("Constant", value_t=coeffA)
+            coeffB_ = g.op("Constant", value_t=coeffB)
+            coeffC_ = g.op("Constant", value_t=coeffC)
+            n_levels_ = g.op("Constant", value_t=n_levels)
+
+            return g.op("PACTOps::iMaskSoftmax", x, mask, log2_t=log2, coeffA_t=coeffA, coeffB_t=coeffB,  coeffC_t=coeffC, n_levels_t=n_levels)
+        
+    def forward(self, att_scores, mask):
+        B, T = att_scores.size(0), att_scores.size(2)
+        probs = []
+        # in inference, only allows batch-size 1. 
+        assert B == 1, "Batch size should be 1 in inference"
+            
+        # (H, T, T)
+        att_score_i = att_scores[0]
+        mask_i = mask[0][0][0]          
+        num_zero = (mask_i == 0).sum().item()
+        extracted_score = att_score_i[:, :, : num_zero]
+        IBERT_tensor = self._IBERT_forward(extracted_score)
+        probs.append(F.pad(IBERT_tensor, (0, T - num_zero), 'constant', 0))
+        stacked_tensor = torch.stack(probs, dim=0)
+                
+                
+    def __init__(self, n_levels: int = 256, eps_in: float = 1./255, export_node=False):
+        super().__init__()
+        self.eps_in = eps_in
+        self.n_levels = torch.Tensor((n_levels,))
+        self.coeffA = torch.Tensor((0.35815147,))
+        self.coeffB = torch.Tensor((1.353,))
+        self.coeffC = torch.Tensor((0.344,))
+        self.log2 = torch.Tensor((1.,))
+        self.zero = torch.Tensor((0.,))
+        
+        self.updateCoeffs(eps_in)
+        self.export_node = export_node
+    
+    def updateCoeffs(self, eps):
+        """Updates the coefficients, usually only done with the IntegerizeSoftmax pass
+
+        :param eps: Input epsilon
+        :returns:
+        :rtype:
+
+        """
+        eps = eps
+        eps2 = torch.Tensor((0.3585,))
+
+        self.coeffA.data[0] = torch.round(0.3585/eps2)
+        self.coeffB.data[0] = torch.round(1.353/eps)
+        self.coeffC.data[0] = torch.round(0.344/(eps**2*eps2))
+
+        #self.log2.data[0] = 2**torch.round(torch.Tensor((math.log2(math.log2(2)/(eps)),)))
+        #self.log2.data[0] = torch.round(torch.Tensor((math.log2(2)/(eps)),))
+        self.log2.data[0] = torch.round(math.log2(2)/(eps))
+    
+    def forward(self, x, mask):
+        if self.export_node:
+            return self.MyMaskSoftmax.apply(x, mask, self.log2.type_as(x), self.coeffA.type_as(x), self.coeffB.type_as(x), self.coeffC.type_as(x), self.n_levels.type_as(x), self.zero.type_as(x))
+        else:
+            return self.MyMaskSoftmax.forward(None, x, mask, self.log2.type_as(x), self.coeffA.type_as(x), self.coeffB.type_as(x), self.coeffC.type_as(x), self.n_levels.type_as(x), self.zero.type_as(x))
+
+                
+
 class PACTSoftmax(_PACTEps):
-    def __init__(self, n_levels : int = 256, dim: int = 1):
+    def __init__(self, n_levels : int = 256, dim: int = 1, **kwargs):
         super().__init__(True)
         self.n_levels = n_levels
         self.dim = dim
@@ -2406,6 +2735,173 @@ class PACTLayerNorm(_PACTEps, _PACTLinOp):
     def get_eps_out(self, eps_in):
         self.set_eps_in([eps_in])
         eps_out_div = self.div.get_eps_out(self.eps_in*self.get_eps_w(), self.eps_in)
+        # print("in PACTLayerNorm, eps_out_div is : ", eps_out_div)
+        return eps_out_div.type_as(eps_in)
+
+    def set_eps_in(self, eps_in_list):
+        super().set_eps_in(eps_in_list)
+
+        t = self.eps_in / torch.sqrt(self.eps)
+        self.eta = torch.ceil(t)
+
+        self.div.set_eps_in([self.eps_in*self.get_eps_w(), self.eps_in])
+
+    def forward(self, x):
+        return F.layer_norm(x, normalized_shape=self.normalized_shape, weight=self.weight, bias=self.bias)
+        assert torch.isnan(x).any() == False, "input x should not be nan"
+        # print(f"torch.isnan(x).any() is : {torch.isnan(x).any()}")
+        # print(f"x is {x}")
+
+        def RQ(x, eps):
+            if self.started:
+                x = torch.floor(x/eps+0.5)*eps 
+            return x
+
+        nom = x - RQ(torch.mean(x, -1, keepdim=True), self.eps_in)
+        var = RQ(torch.mean(torch.pow(nom, 2), -1, keepdim=True), self.eps_in**2 )
+        var = var * self.eta**2
+        nom = nom * self.eta
+        eps = RQ(self.eta**2 * self.eps , self.eps_in**2)
+
+        if self.started:
+            assert eps>=self.eps_in**2, f"Eps was rounded down in PACTLayerNorm, eta = {self.eta}, eps = {self.eps}, eps_in = {self.eps_in}"
+
+        denom = RQ(torch.sqrt(var + eps), self.eps_in)
+        
+
+        if not torch.sum( denom > 0 ) == len(denom.reshape(-1)):
+            # print(f"torch.isnan(x).any() is : {torch.isnan(x).any()}")
+            # print(f"torch.mean(x, -1, keepdim=True) is : {torch.isnan(torch.mean(x, -1, keepdim=True)).any()}")
+            # print(f"RQ(torch.mean(x, -1, keepdim=True), self.eps_in) is : {torch.isnan(RQ(torch.mean(x, -1, keepdim=True), self.eps_in)).any()}")
+
+            # print(f"nom is : {nom}")
+            # print(f"torch.pow(nom, 2) is : {torch.pow(nom, 2)}")
+            
+            # print(f"torch.mean(torch.pow(nom, 2), -1, keepdim=True) is : {torch.mean(torch.pow(nom, 2), -1, keepdim=True)}")
+            # print(f"self.eps_in**2 is : {self.eps_in**2 }")
+            # print(f"RQ(torch.mean(torch.pow(nom, 2), -1, keepdim=True), self.eps_in**2 ) is : {RQ(torch.mean(torch.pow(nom, 2), -1, keepdim=True), self.eps_in**2 )}")
+            # print(f"self.eta is : {self.eta}")
+            # print(f"self.eta**2 is : {self.eta**2}")
+            # print(f"var is : {var}")
+            # # print(f"denom is : {denom}")
+            # print(f"eps is : {eps}")
+            # print(f"eps_in is : {self.eps_in}")
+            # print(f"torch.sqrt(var + eps) is : {torch.sqrt(var + eps)}")
+
+            # print(f"denom before is : {denom}")
+            # denom += 1e-8
+            # print(f"denom after is : {denom}")
+            # print(torch.sum( denom > 0 ))
+            assert torch.sum( denom > 0 ) == len(denom.reshape(-1)), "Denominator: Denominator negative numbers not allowed!"
+
+            # neg_denom = denom[denom < 0]
+            # neg_var = var[var < 0]
+            # print(f"Negative values in denom: {neg_denom}")
+            # print(f"Negative values in var: {neg_var}")
+            # print(f"sum of denom: {torch.sum( denom > 0 )}")
+            # print(f"denom shape is : {denom.shape}")
+            # # print(f"var is : {var}")
+            # # print(f"denom is : {denom}")
+            # print(f"eps is : {eps}")
+            # print(f"eps_in is : {self.eps_in}")
+
+        if self.started:
+            nom = nom*self.weight_q
+        else:
+            nom = nom*self.weight
+
+        b = self.bias
+
+        assert torch.sum( denom > 0 ) == len(denom.reshape(-1)), "PACTLayerNorm: Denominator negative numbers not allowed!"
+        y = self.div(nom, denom) + b
+        return y
+
+class PACTIntegerRMSNorm(torch.nn.Module):
+
+    class MyRMSNorm(torch.autograd.Function):
+
+        @staticmethod
+        def forward(ctx, x, weight, D, n_levels):
+            nom = x
+            denom = torch.floor(torch.sqrt(torch.floor(torch.mean(nom**2, len(x.shape)-1, keepdim=True))+1))
+
+            nom = nom * weight
+
+            y = (torch.div(nom,denom))
+
+            y = torch.floor(y/(D))
+            y = torch.clip(y, -n_levels//2, n_levels//2-1)
+            return y
+
+        @staticmethod
+        @parse_args('v','v','i','i')
+        def symbolic(g, x, weight, D, n_levels):
+
+            return g.op("PACTOps::iRMSNorm", x, weight, D_i=D, n_levels_i=n_levels)
+
+
+    def __init__(self, n_levels: int = 256, eps_in : float = 1., maxval: float = 1., weight : torch.Tensor = torch.Tensor((1.,)), D=2**24, export_node=False, **kwargs):
+        super().__init__()
+
+        self.n_levels = torch.Tensor((n_levels,)).detach()
+
+        self.eps = torch.Tensor((eps_in,)).detach()
+        self.D = torch.Tensor((D,)).detach()
+
+        # dummyOne and dummyZero are there to have a comparison value on Multi-GPU systems to check if weight are used
+
+        self.floor = torch.Tensor((False,)).detach()
+        self.clip_gradient = torch.Tensor((True,)).detach()
+        self.noisy = torch.Tensor((False,)).detach()
+
+        # Maxval is used to track statistics
+        self.maxval = torch.Tensor((maxval,)).detach()
+
+        dummyOne =  torch.Tensor((1.,)).type_as(weight)
+
+        self.export_node = export_node
+
+        if not torch.equal(weight, dummyOne):
+            clip_lo = -torch.max(torch.abs(weight))
+            clip_hi = AlmostSymmQuantFunc.apply(clip_lo, n_levels)
+
+            eps_weights = (clip_hi-clip_lo)/(n_levels-1)
+
+            self.eps_weights =  eps_weights.detach()
+
+            self.register_buffer("weight", torch.Tensor(torch.round(PACTQuantize(weight, eps_weights, clip_lo, clip_hi, self.floor, self.clip_gradient, self.noisy) / eps_weights ).detach()))
+            self.register_buffer("totScaler", torch.Tensor((torch.round(self.D * (n_levels//2-1)/maxval * eps_weights ),)).detach())
+
+            self.weight *= self.totScaler
+
+        else:
+            self.register_buffer("totScaler",torch.Tensor((torch.round(self.D * (n_levels//2-1)/maxval ),)).detach())
+            self.register_buffer("weight",self.totScaler.clone().detach())
+
+    def forward(self, x):
+        if self.export_node:
+            return self.MyRMSNorm.apply(x, self.weight, int(self.D.item()), int(self.n_levels.item()))
+        else:
+            return self.MyRMSNorm.forward(None, x, self.weight, self.D, self.n_levels)
+
+class PACTRMSNorm(_PACTEps, _PACTLinOp):
+
+    def __init__(self, normalized_shape = None, weight = torch.Tensor((1.,)), eps=1e-3, *args, **kwargs):
+        _PACTLinOp.__init__(self)
+        _PACTEps.__init__(self)
+        self.setup_quant_params(*args, **kwargs)
+
+        self.normalized_shape = normalized_shape
+        self.weight = nn.Parameter(weight)
+
+        self.register_buffer('eps', torch.Tensor((eps,)))
+        self.register_buffer('eta', torch.Tensor((1.,)))
+
+        self.div = PACTDiv(Delta=1., stable=False, autoscale=True)
+
+    def get_eps_out(self, eps_in):
+        self.set_eps_in([eps_in])
+        eps_out_div = self.div.get_eps_out(self.eps_in*self.get_eps_w(), self.eps_in)
         return eps_out_div.type_as(eps_in)
 
     def set_eps_in(self, eps_in_list):
@@ -2422,14 +2918,14 @@ class PACTLayerNorm(_PACTEps, _PACTLinOp):
                 x = torch.floor(x/eps+0.5)*eps
             return x
 
-        nom = x - RQ(torch.mean(x, -1, keepdim=True), self.eps_in)
+        nom = x
         var = RQ(torch.mean(torch.pow(nom, 2), -1, keepdim=True), self.eps_in**2 )
         var = var * self.eta**2
         nom = nom * self.eta
         eps = RQ(self.eta**2 * self.eps , self.eps_in**2)
 
         if self.started:
-            assert eps>=self.eps_in**2, f"Eps was rounded down in PACTLayerNorm, eta = {self.eta}, eps = {self.eps}, eps_in = {self.eps_in}"
+            assert eps>=self.eps_in**2, f"Eps was rounded down in PACTRMSNorm, eta = {self.eta}, eps = {self.eps}, eps_in = {self.eps_in}"
 
         denom = RQ(torch.sqrt(var + eps), self.eps_in)
 
@@ -2438,9 +2934,7 @@ class PACTLayerNorm(_PACTEps, _PACTLinOp):
         else:
             nom = nom*self.weight
 
-        b = self.bias
-
-        y = self.div(nom, denom) + b
+        y = self.div(nom, denom)
         return y
 
 class PACTWrapLinearAttention(nn.Module):
@@ -2916,10 +3410,27 @@ class PACTDiv(_PACTEps):
         self.set_eps_in([torch.Tensor((eps_div,)), torch.Tensor((eps_div,))])
 
     def set_eps_in(self, eps_in_list):
+        # print("here in div")
+        # import inspect
+
+        # stack = inspect.stack()
+        # caller_frame = stack[1]
+        # caller_function_name = caller_frame.function
+        # print(f"Called by function: {caller_function_name}")
+
+
         if len(eps_in_list) == 2:
+            # print(f"the eps len is: {len(eps_in_list)}" )
+            # print(self.eps_in_x.shape)
+            # print(eps_in_list[0].shape)
             self.eps_in_x[:] = eps_in_list[0]
             self.eps_in_y[:] = eps_in_list[1]
+            # self.eps_in_x = eps_in_list[0]
+            # self.eps_in_y = eps_in_list[1]
         else:
+            # print(f"the eps len is: {len(eps_in_list)}")
+            # self.eps_in_x = eps_in_list[0]
+            # self.eps_in_y = eps_in_list[0]
             self.eps_in_x[:] = eps_in_list[0]
             self.eps_in_y[:] = eps_in_list[0]
         assert self.eps_in_y > 0, "PACTDiv: Denominator's eps is lt or eq 0!"
@@ -2931,7 +3442,12 @@ class PACTDiv(_PACTEps):
             self.eta = torch.Tensor((1.,)).type_as(self.eps_in_x)
 
     def get_eps_out(self, eps_in_x=None, eps_in_y=None):
+        # print("in get_eps_out")
+        # print(eps_in_x.shape)
+        # print(eps_in_y)
         if eps_in_x is not None and eps_in_y is not None:
+            # print("setting eps_in")
+            # print(f"the input length is {len([eps_in_x, eps_in_y])}")
             self.set_eps_in([eps_in_x, eps_in_y])
         if not self.locked:
             return self.eps_in_x / (self.eps_in_y*self.Delta)
@@ -2980,8 +3496,14 @@ class PACTDiv(_PACTEps):
                 self.Delta = torch.abs(torch.ceil(self.running_min**(-1)))
 
         if not self.locked:
+            # print("in forward: ")
+            # print(self.eps_in_x)
+            # print(self.eps_in_y)
             return RQ(x/y , self.get_eps_out(self.eps_in_x, self.eps_in_y))
         else:
+            # print("in forward: ")
+            # print(self.eps_in_x)
+            # print(self.eps_in_y)
             return RQ(x*self.Delta/y , self.get_eps_out(self.eps_in_x, self.eps_in_y))
 
 class PACTIntegerDiv(nn.Module):
@@ -2990,7 +3512,7 @@ class PACTIntegerDiv(nn.Module):
 
         @staticmethod
         def forward(ctx, x, y, Delta, eps, eta):
-            return torch.floor((x * Delta * eta / (y*eta + eps)) + 0.5)
+            return x * torch.trunc((Delta * eta / (y*eta + eps)))
 
         @staticmethod
         @parse_args('v','v','i', 'i', 'i')
@@ -2999,9 +3521,39 @@ class PACTIntegerDiv(nn.Module):
 
     def __init__(self, Delta, integer_node=True, eps=1., eta=1.):
         super().__init__()
-        self.register_buffer('Delta',torch.Tensor((Delta,)))
-        self.register_buffer('eps',torch.Tensor((eps,)))
-        self.register_buffer('eta', torch.Tensor((eta,)))
+        self.register_buffer('Delta',torch.Tensor((int(Delta),)))
+        self.register_buffer('eps',torch.Tensor((int(eps),)))
+        self.register_buffer('eta', torch.Tensor((int(eta),)))
+        self.integer_node = integer_node
+
+    def forward(self,x,y):
+
+        if not isinstance(y, torch.Tensor):
+            raise Exception("IntegerDiv trying to divide by const!")
+
+        if self.integer_node:
+            return self.MyIntegerDiv.apply(x,y,int(self.Delta.item()),int(self.eps.item()), int(self.eta.item()))
+        else:
+            return self.MyIntegerDiv.forward(None, x,y,self.Delta,self.eps, self.eta)
+
+class PACTTrueIntegerDiv(nn.Module):
+
+    class MyTrueIntegerDiv(torch.autograd.Function):
+
+        @staticmethod
+        def forward(ctx, x, y, Delta, eps, eta):
+            return x * np.trunc((Delta * eta / (y*eta + eps)))
+
+        @staticmethod
+        @parse_args('v','i','i', 'i', 'i')
+        def symbolic(g, x, y, Delta, eps, eta):
+            return g.op("PACTOps::TrueIntegerDiv", x, y_i = y, Delta_i = Delta, eps_i=eps, eta_i = eta)
+
+    def __init__(self, Delta, integer_node=True, eps=1., eta=1.):
+        super().__init__()
+        self.register_buffer('Delta',torch.Tensor((int(Delta),)))
+        self.register_buffer('eps',torch.Tensor((int(eps),)))
+        self.register_buffer('eta', torch.Tensor((int(eta),)))
         self.integer_node = integer_node
 
     def forward(self,x,y):
@@ -3012,10 +3564,15 @@ class PACTIntegerDiv(nn.Module):
         #         return x
         #     return x * self.Delta
 
+        if isinstance(y, torch.Tensor):
+            raise Exception("TrueIntegerDiv trying to divide by tensor!")
+
         if self.integer_node:
-            return self.MyIntegerDiv.apply(x,y,int(self.Delta.item()),int(self.eps.item()), int(self.eta.item()))
+
+            return self.MyTrueIntegerDiv.apply(x,int(y),int(self.Delta.item()),int(self.eps.item()), int(self.eta.item()))
         else:
-            return self.MyIntegerDiv.forward(None, x,y,self.Delta,self.eps, self.eta)
+            return self.MyTrueIntegerDiv.forward(None, x,y,self.Delta,self.eps, self.eta)
+
 
 class PACTConstWrap(nn.Module):
     def __init__(self, eps=1.):

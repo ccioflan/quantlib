@@ -3,6 +3,7 @@
 #
 # Author(s):
 # Georg Rutishauser <georgr@iis.ee.ethz.ch>
+# Yifan Bao <yifbao@student.ethz.ch>
 #
 # Copyright (c) 2020-2021 ETH Zurich.
 #
@@ -234,6 +235,7 @@ class PACTActController(Controller):
                 elif cmd == 'start':
                     for m in self.modules:
                         self.reset_clip_bounds(m, m.init_clip)
+                        m.resetHistogram()
                         m.started |= True
                     self.log("Started activation quantization!")
 
