@@ -1363,7 +1363,6 @@ class PACTCausalConv1d(PACTConv1d, _PACTLinOp):
 
 class PACTLinear(nn.Linear, _PACTLinOp):
     def __init__(self,
-                 ture_linear,
                  in_features : int,
                  out_features : int,
                  n_levels : int = 256,
@@ -1394,7 +1393,6 @@ class PACTLinear(nn.Linear, _PACTLinOp):
                                 tqt_beta=tqt_beta,
                                 tqt_clip_grad=tqt_clip_grad,
                                 rounding=rounding)
-        self.ture_linear = ture_linear
         self.register_buffer('weight_frozen', self.weight.data.clone())
         if self.bias is not None:
             self.register_buffer('bias_frozen', self.bias.data.clone())
@@ -1426,7 +1424,6 @@ class PACTLinear(nn.Linear, _PACTLinOp):
         return self.get_eps_w().flatten().type_as(eps_in)*eps_in
 
     def forward(self, x):
-        # return self.ture_linear(x)
         b = self.bias
         if self.started:
             w = self.weight_q
@@ -1542,6 +1539,7 @@ class PACTHardGLU(nn.Module):
         super(PACTHardGLU, self).__init__()
         self.dim = dim
         self.eps_s = torch.Tensor([eps_s])
+        
     def _hardsigmoid_forward(self, x):
         three = torch.tensor(3., dtype=x.dtype, device=x.device)
         six = 2 * three

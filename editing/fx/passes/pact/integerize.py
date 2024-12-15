@@ -5,7 +5,6 @@
 # Georg Rutishauser <georgr@iis.ee.ethz.ch>
 # Moritz Scherer <scheremo@iis.ee.ethz.ch>
 # Victor Jung <jungvi@iis.ee.ethz.ch>
-# Yifan Bao <yifbao@student.ethz.ch>
 #
 # Copyright (c) 2020-2021 ETH Zurich.
 #
@@ -31,6 +30,7 @@ from torch import fx, nn
 from torch.fx.subgraph_rewriter import Match
 
 from quantlib.algorithms.pact.pact_ops import *
+from quantlib.algorithms.generic.generic_ops import *
 from quantlib.algorithms.pact.pact_ops import RequantShift, HardActRequantShift, ChannelwiseThreshold
 from .harmonize import InsertBNBetweenBiasedConvAndActsPass, RQSMergePass
 from .pact_util import PACTTracer, PACT_symbolic_trace
@@ -100,7 +100,10 @@ def integerize_hardglu_fun(gm : fx.GraphModule, match : Match, D=2**14, export_n
     eps_in = extract_eps(lin_node.meta['quant'].eps_in)
     assert isinstance(module, PACTHardGLU), f"integerize_hardglu_fun got bad match - expected PACTHardGLU, got {type(module)}"
 
-    new_hardglu = PACTIntegerHardGLU(dim=1, eps_in=eps_in, export_node=export_node)
+    use_fake_IntegerHardGLU = False
+    if use_fake_IntegerHardGLU:
+        return FakePACTIntegerHardGLU(dim=1, eps_in=eps_in, eps_s=module.eps_s, export_node=export_node)
+    new_hardglu = PACTIntegerHardGLU(dim=1, eps_in=eps_in, eps_s=module.eps_s, export_node=export_node)
 
     return new_hardglu
 ###
@@ -127,6 +130,19 @@ class IntegerizeConstWrapPass(ModularizePass):
     def __init__(self, **kwargs):
         target = [PACTConstWrap()]
         super().__init__(op='call_module', target=tuple(target), replacement_fn = self.constwrap_replacement_fn, name="CONSTWRAP_REPLACEMENT_PASS")
+
+# Multiplication was folded into scaling factor
+class IntegerizeMulPass(ModularizePass):
+
+    @staticmethod
+    def muliply_replacement_fn(node):
+        return (nn.Identity(), node.args[:1], node.kwargs)
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        target = [Multiply()]
+        super().__init__(op='call_module', target=tuple(target), replacement_fn = partial(self.muliply_replacement_fn), name="MULTIPLY_INTEGERIZE_PASS")
+
 
 class IntegerizeMeanPass(ModularizePass):
 
@@ -155,16 +171,43 @@ class IntegerizeTrueDivPass(ModularizePass):
 
 def integerize_layernorm_fun(gm : fx.GraphModule, match : Match, affine = True, D=2**12, export_node=False):
     modules = gm_modules(gm)
-    matched_nodes = [m for k, m in match.nodes_map.items() if k.op == 'call_module']
+    matched_nodes = [m for k, m in match.nodes_map.items() if k.op == 'call_module'][::-1]
     layernorm_node = matched_nodes[0]
     matched_modules = [modules[m.target] for k, m in match.nodes_map.items() if k.op == 'call_module'][::-1]
     layernorm = matched_modules[0]
     requant = matched_modules[1]
+
     eps_in = extract_eps(layernorm_node.meta['quant'].eps_in)
-    assert isinstance(layernorm, PACTLayerNorm), f"integerize_layernorm_fun got bad match - expected PACTLayerNorm, got {type(module)}"
+    assert isinstance(layernorm, PACTLayerNorm), f"integerize_layernorm_fun got bad match - expected PACTLayerNorm, got {type(layernorm)}"
+    
+    # modules = gm_modules(gm)
+    # matched_nodes = [m for k, m in match.nodes_map.items() if k.op == 'call_module']
+    # layernorm_node = matched_nodes[0]
+    # matched_modules = [modules[m.target] for k, m in match.nodes_map.items() if k.op == 'call_module'][::-1]
+    # layernorm = matched_modules[0]
+    # requant = matched_modules[1]
+    # print(layernorm_node)
+    # eps_in = extract_eps(layernorm_node.meta['quant'].eps_in)
+    # print(f"eps_in of layernorm is {eps_in}")
+    # print(f"pactlayernorm._eps_in is {layernorm._eps_in}")
+    # assert isinstance(layernorm, PACTLayerNorm), f"integerize_layernorm_fun got bad match - expected PACTLayerNorm, got {type(module)}"
+
+    # use_fake_IntegerLayerNorm = False
+    # if use_fake_IntegerLayerNorm:
+    #     eps_out = layernorm_node.meta['quant'].eps_out
+    #     eps_in_act = matched_nodes[1].meta['quant'].eps_in[0][0]
+    #     eps_out_act = matched_nodes[1].meta['quant'].eps_out 
+    #     # print(f"layernorm eps_out is: {eps_out}, eps_in_act is: {eps_in_act}, eps_out_act is: {eps_out_act}")
+    #     new_layernorm = FakePACTIntegerLayerNorm(layernorm.normalized_shape, weight=layernorm.weight, bias=layernorm.bias, eps_in=eps_in, eps_out=eps_out, eps_in_act = eps_in_act,eps_out_act=eps_out_act)
+    #     return new_layernorm
 
     maxval = max(requant.max, -requant.min)
-
+    # eps_out = layernorm_node.meta['quant'].eps_out
+    # eps_in_act = matched_nodes[1].meta['quant'].eps_in[0][0]
+    # eps_out_act = matched_nodes[1].meta['quant'].eps_out 
+    # print(eps_out)
+    # print(eps_in_act)
+    # print(eps_out_act)
     if affine:
         new_weight = layernorm.weight
         new_bias = layernorm.bias
@@ -178,6 +221,7 @@ class IntegerizeLayerNormPass(SequentialPass):
     def __init__(self, affine = True, D=2**12, export_layernorm_node = False, symbolic_trace: callable = PACT_symbolic_trace, **kwargs):
         passes = []
         pattern = nn.Sequential(PACTLayerNorm(), PACTAsymmetricAct(256, 'max', True, 'relu'))
+        # pattern = nn.Sequential(PACTLayerNorm())
         passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, partial(integerize_layernorm_fun, affine=affine, D=D, export_node=export_layernorm_node), f'_INTEGER_LAYERNORM_PASS'))
         super().__init__(*passes, name_prefix='_INTEGER_LAYERNORM_PASS')
 
@@ -213,7 +257,12 @@ class IntegerizeMaskSoftmaxPass(ModularizePass):
     @staticmethod
     def integerize_masksoftmax_fun(node, integer_node=False):
         module = dict(node.graph._owning_module.named_modules())[node.target]
-        return (PACTIntegerMaskSoftmax(n_levels=module.n_levels, eps = extract_eps(node.meta['quant'].eps_in), export_node=integer_node))
+        use_fake_IntegerMaskSoftmax = False
+        if use_fake_IntegerMaskSoftmax:
+            return (FakePACTIntegerMaskSoftmax(n_levels=module.n_levels, eps_in = node.meta['quant'].eps_in[0][0], export_node=integer_node), node.args, node.kwargs)
+        # for extrac_eps, only use the eps for x. mask eps is useless
+        # not sure the use of extract_eps
+        return (PACTIntegerMaskSoftmax(n_levels=module.n_levels, eps_in = node.meta['quant'].eps_in[0][0], export_node=integer_node), node.args, node.kwargs)
 
     def __init__(self, D=2**12, export_masksoftmax_node = False, **kwargs):
         self.kwargs = kwargs
@@ -245,7 +294,7 @@ class IntegerizeGELUPass(SequentialPass):
 class IntegerizeHardGLUPass(SequentialPass):
     def __init__(self, export_glu_node=False, symbolic_trace: callable = PACT_symbolic_trace, **kwargs):
         passes = []
-        pattern = nn.Sequential(PACTHardGLU())
+        pattern = nn.Sequential(PACTHardGLU(1, eps_s=1.0))
         passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, partial(integerize_hardglu_fun,export_node=export_glu_node), f'_INTEGER_HARDGLU_PASS'))
         super().__init__(*passes, name_prefix='_INTEGER_HARDGLU_PASS')
 
@@ -457,13 +506,17 @@ def bn_act_to_requant_fun(gm : fx.GraphModule, match : Match, D=2**24, cmsis_req
             # mul/add parameters must have different shape. we use the
             # information stored in the graph by the ShapePropPass to determine
             # this.
-            bn_outshape = bn_node.meta['tensor_meta'].shape
-            if len(bn_outshape) == 3:
-                gamma_h = gamma_h.reshape((gamma_h.numel(), 1))
-                beta_h = beta_h.reshape((beta_h.numel(), 1))
-            elif len(bn_outshape) == 2:
-                gamma_h = gamma_h.reshape((gamma_h.numel(),))
-                beta_h = beta_h.reshape((beta_h.numel(),))
+            # bn_outshape = bn_node.meta['tensor_meta'].shape
+            # if len(bn_outshape) == 3:
+            #     gamma_h = gamma_h.reshape((gamma_h.numel(), 1))
+            #     beta_h = beta_h.reshape((beta_h.numel(), 1))
+            # elif len(bn_outshape) == 2:
+            #     gamma_h = gamma_h.reshape((gamma_h.numel(),))
+            #     beta_h = beta_h.reshape((beta_h.numel(),))
+            # don't know where tensor_meta is 
+            # set shape is 3:
+            gamma_h = gamma_h.reshape((gamma_h.numel(), 1))
+            beta_h = beta_h.reshape((beta_h.numel(), 1))
         elif isinstance(bn, nn.BatchNorm2d):
             gamma_h = gamma_h.reshape((gamma_h.numel(), 1, 1))
             beta_h = beta_h.reshape((beta_h.numel(), 1, 1))

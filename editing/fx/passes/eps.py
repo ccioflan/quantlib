@@ -62,6 +62,11 @@ def eps_conversion_pact_gelu(m : nn.Module, eps_in : torch.Tensor):
 def eps_conversion_pact_matmul(m : nn.Module, *eps_ins):
     return eps_ins[0] * eps_ins[1].type_as(eps_ins[0])
 
+def eps_conversion_mul(m : nn.Module, *eps_in):
+    print (eps_in)
+    # return eps_in[0] * eps_in[1].type_as(eps_in[0]) # ORIGINAL
+    return eps_in[0] * eps_in[0].type_as(eps_in[0])
+
 def eps_conversion_matmul(*eps_ins):
     return eps_ins[0] * eps_ins[1].type_as(eps_ins[0])
 
@@ -104,8 +109,8 @@ def eps_conversion_PACTWrapModule(m : nn.Module, *eps_in):
     else:
         return eps_in[0]
 
-def eps_conversion_mul(m : nn.Module, *eps_in):
-    return eps_in[0] * eps_in[1].type_as(eps_in[0])
+def eps_conversion_matmul(*eps_ins):
+    return eps_ins[0] * eps_ins[1].type_as(eps_ins[0])
 
 def eps_conversion_first_in(m : nn.Module, *eps_in):
     if len(eps_in) > 0:
