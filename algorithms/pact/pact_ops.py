@@ -35,7 +35,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.fx
 from torch.onnx import register_custom_op_symbolic
-from torch.onnx.symbolic_helper import parse_args
+from torch.onnx.symbolic_helper import parse_args, _get_tensor_sizes
 
 from quantlib.algorithms.generic import CausalConv1d
 from quantlib.QTensor import QTensor
@@ -123,7 +123,7 @@ class RequantShift(nn.Module):
             else:
                 y = x * mul + add
                 # Avoid round to even behaviour, friggin pytorch
-                y = torch.floor((y / div) + 0.5)
+                y = torch.floor((y / div))
 
             if not signed:
             # if unsigned: clip y to interval (0, n_levels-1)
@@ -239,20 +239,24 @@ class ChannelwiseThreshold(nn.Module):
     class MyChannelwiseThreshold(torch.autograd.Function):
 
         @staticmethod
-        def forward(ctx, x, thresh_lo, thresh_hi):
+        def forward(ctx, x, thresh_lo, thresh_hi, signed_out):
             tmp1 = -1*(x < thresh_lo).type_as(x)
             tmp2 = (x >= thresh_hi).type_as(x)
 
             return tmp1 + tmp2
 
         @staticmethod
-        @parse_args('v', 't', 't')
-        def symbolic(g, x, thresh_lo, thresh_hi):
-            thresh_lo_ = g.op("Constant", value_t=thresh_lo)
-            thresh_hi_ = g.op("Constant", value_t=thresh_hi)
-            return g.op("PACTOps::ChannelwiseThreshold2d", x, thresh_lo_t=thresh_lo, thresh_hi_t=thresh_hi)
+        @parse_args('v', 'is', 'is', 'i')
+        def symbolic(g, x, thresh_lo, thresh_hi, signed_out):
+            return g.op("PACTOps::ChannelwiseThreshold2d",
+                        x, thresh_lo_i=thresh_lo, thresh_hi_i=thresh_hi,
+                        signed_out_i=signed_out).setType(x.type().with_sizes(_get_tensor_sizes(x)))
 
-    def __init__(self, thresh_lo : torch.Tensor, thresh_hi : torch.Tensor, n_dim : Literal[1,2] = 2):
+    def __init__(self, thresh_lo : torch.Tensor, thresh_hi : torch.Tensor, n_dim : Literal[1,2] = 2, signed_out : bool = True):
+        # signed: only used in the exported graph to indicate whether the conv
+        # following this threshold should interpret it as (originally)
+        # producing signed outputs. If not, the calculations are the same (!)
+        # but the padding needs to be with -1.
         super(ChannelwiseThreshold, self).__init__()
         if n_dim == 1:
             thresh_shape = (-1, 1)
@@ -262,9 +266,13 @@ class ChannelwiseThreshold(nn.Module):
             assert False, f"ChannelwiseThreshold: n_dim must be 1 or 2, got {n_dim}!"
         self.register_buffer('thresh_lo', thresh_lo.reshape(*thresh_shape).clone().detach())
         self.register_buffer('thresh_hi', thresh_hi.reshape(*thresh_shape).clone().detach())
+        self.register_buffer('signed_out', torch.tensor(int(signed_out)))
 
     def forward(self, x):
-        return self.MyChannelwiseThreshold.apply(x, self.thresh_lo.data.type_as(x), self.thresh_hi.data.type_as(x))
+        return self.MyChannelwiseThreshold.apply(x,
+                                                 self.thresh_lo.data.type_as(x),
+                                                 self.thresh_hi.data.type_as(x),
+                                                 self.signed_out.data)
 
 r"""Broadly configurable implementations of the PACT
 (https://arxiv.org/pdf/1807.06964) and TQT (https://arxiv.org/abs/1903.08066)
@@ -635,7 +643,8 @@ class PACTIntegerConcat(torch.nn.Module):
                     max_clip = i.clip_hi.data
                     min_clip = i.clip_lo.data
                     diff = max_clip - min_clip
-                    eps = diff/(self.n_levels-1)
+                    # eps = diff/(self.n_levels-1) # OBSOLETE
+                    eps = diff/(self.n_levels_in-1)
 
         else:
             clip_hi = self.act_out.clip_hi.data.detach().clone()
@@ -1101,6 +1110,18 @@ class PACTConv2d(nn.Conv2d, _PACTLinOp):
         return result
 
 
+    # do not use in training!
+    def get_bias_q(self, eps_in):
+        # we assume that bias gets quantized to a really high bitwidth so don't
+        # clip it
+        with torch.no_grad():
+            b = PACTQuantize(self.bias, self.get_eps_out(eps_in).flatten(), -2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_lo.flatten()), 2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_hi.flatten()), clip_gradient=self.clip_gradient, floor=False)
+        return b
+
+    # do not use in training!
+    def get_bias_int(self, eps_in):
+        return (self.get_bias_q(eps_in)/self.get_eps_out(eps_in).flatten()).round()
+
     # this is not very pretty. Any suggestions on how to avoid it are welcome...
     def extra_repr(self):
         return _PACTLinOp.extra_repr(self)
@@ -1223,6 +1244,18 @@ class PACTConv1d(nn.Conv1d, _PACTLinOp):
             result.eps = self.get_eps_out(x.eps)
         return result
 
+    # do not use in training!
+    def get_bias_q(self, eps_in):
+        # we assume that bias gets quantized to a really high bitwidth so don't
+        # clip it
+        with torch.no_grad():
+            b = PACTQuantize(self.bias, self.get_eps_out(eps_in).flatten(), -2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_lo.flatten()), 2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_hi.flatten()), clip_gradient=self.clip_gradient, floor=False)
+        return b
+
+    # do not use in training!
+    def get_bias_int(self, eps_in):
+        return (self.get_bias_q(eps_in)/self.get_eps_out(eps_in).flatten()).round()
+
     def extra_repr(self):
         return _PACTLinOp.extra_repr(self)
 
@@ -1335,6 +1368,18 @@ class PACTCausalConv1d(PACTConv1d, _PACTLinOp):
         return result
 
 
+    # do not use in training!
+    def get_bias_q(self, eps_in):
+        # we assume that bias gets quantized to a really high bitwidth so don't
+        # clip itp
+        with torch.no_grad():
+            b = PACTQuantize(self.bias, self.get_eps_out(eps_in).flatten(), -2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_lo.flatten()), 2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_hi.flatten()), clip_gradient=self.clip_gradient, floor=False)
+        return b
+
+    # do not use in training!
+    def get_bias_int(self, eps_in):
+        return (self.get_bias_q(eps_in)/self.get_eps_out(eps_in).flatten()).round()
+
     @classmethod
     def from_causalconv1d(cls, c : CausalConv1d, **kwargs):
         # kwargs should be arguments to PACTCausalConv1d
@@ -1413,12 +1458,12 @@ class PACTLinear(nn.Linear, _PACTLinOp):
         # we assume that bias gets quantized to a really high bitwidth so don't
         # clip it
         with torch.no_grad():
-            b = PACTQuantize(self.bias, self.get_eps_out(eps_in), -1000.*torch.ones_like(self.clip_lo.flatten()), 1000.*torch.ones_like(self.clip_hi.flatten()), clip_gradient=self.clip_gradient, floor=False)
+            b = PACTQuantize(self.bias, self.get_eps_out(eps_in), -2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_lo.flatten()), 2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_hi.flatten()), clip_gradient=self.clip_gradient, floor=False)
         return b
 
     # do not use in training!
     def get_bias_int(self, eps_in):
-        return (self.get_bias_q(eps_in)/self.get_eps_out(eps_in)).round()
+        return (self.get_bias_q(eps_in)/self.get_eps_out(eps_in).flatten()).round()
 
     def get_eps_out(self, eps_in):
         return self.get_eps_w().flatten().type_as(eps_in)*eps_in
@@ -1592,6 +1637,8 @@ class PACTIntegerHardGLU(nn.Module):
     def forward(self, x):
         x_in, x_gate = x.chunk(2, dim=self.dim)
         return x_in * self._integer_hardsigmoid_forward(x_gate)
+=======
+>>>>>>> devel
 
 class PACTHardsigmoid(nn.Module):
     def __init__(self, eps_s : float):
@@ -2723,7 +2770,7 @@ class PACTLayerNorm(_PACTEps, _PACTLinOp):
         # clip it
         eps = self.div.get_eps_out(self.eps_in*self.get_eps_w(), self.eps_in)
         with torch.no_grad():
-            b = PACTQuantize(self.bias, eps, -1000.*torch.ones_like(self.clip_lo), 1000.*torch.ones_like(self.clip_hi), clip_gradient=self.clip_gradient)
+            b = PACTQuantize(self.bias, eps, -2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_lo), 2**16*self.get_eps_out(eps_in).flatten()*torch.ones_like(self.clip_hi), clip_gradient=self.clip_gradient)
         return b
 
     # do not use in training!
@@ -2881,6 +2928,127 @@ class PACTIntegerRMSNorm(torch.nn.Module):
             return self.MyRMSNorm.apply(x, self.weight, int(self.D.item()), int(self.n_levels.item()))
         else:
             return self.MyRMSNorm.forward(None, x, self.weight, self.D, self.n_levels)
+
+class PACTRMSNorm(_PACTEps, _PACTLinOp):
+
+    def __init__(self, normalized_shape = None, weight = torch.Tensor((1.,)), eps=1e-3, *args, **kwargs):
+        _PACTLinOp.__init__(self)
+        _PACTEps.__init__(self)
+        self.setup_quant_params(*args, **kwargs)
+
+        self.normalized_shape = normalized_shape
+        self.weight = nn.Parameter(weight)
+
+        self.register_buffer('eps', torch.Tensor((eps,)))
+        self.register_buffer('eta', torch.Tensor((1.,)))
+
+        self.div = PACTDiv(Delta=1., stable=False, autoscale=True)
+
+    def get_eps_out(self, eps_in):
+        self.set_eps_in([eps_in])
+        eps_out_div = self.div.get_eps_out(self.eps_in*self.get_eps_w(), self.eps_in)
+        return eps_out_div.type_as(eps_in)
+
+    def set_eps_in(self, eps_in_list):
+        super().set_eps_in(eps_in_list)
+
+        t = self.eps_in / torch.sqrt(self.eps)
+        self.eta = torch.ceil(t)
+
+        self.div.set_eps_in([self.eps_in*self.get_eps_w(), self.eps_in])
+
+    def forward(self, x):
+        def RQ(x, eps):
+            if self.started:
+                x = torch.floor(x/eps+0.5)*eps
+            return x
+
+        nom = x
+        var = RQ(torch.mean(torch.pow(nom, 2), -1, keepdim=True), self.eps_in**2 )
+        var = var * self.eta**2
+        nom = nom * self.eta
+        eps = RQ(self.eta**2 * self.eps , self.eps_in**2)
+
+        if self.started:
+            assert eps>=self.eps_in**2, f"Eps was rounded down in PACTRMSNorm, eta = {self.eta}, eps = {self.eps}, eps_in = {self.eps_in}"
+
+        denom = RQ(torch.sqrt(var + eps), self.eps_in)
+
+        if self.started:
+            nom = nom*self.weight_q
+        else:
+            nom = nom*self.weight
+
+        y = self.div(nom, denom)
+        return y
+
+class PACTIntegerRMSNorm(torch.nn.Module):
+
+    class MyRMSNorm(torch.autograd.Function):
+
+        @staticmethod
+        def forward(ctx, x, weight, D, n_levels):
+            nom = x
+            denom = torch.floor(torch.sqrt(torch.floor(torch.mean(nom**2, len(x.shape)-1, keepdim=True))+1))
+
+            nom = nom * weight
+
+            y = (torch.div(nom,denom))
+
+            y = torch.floor(y/(D))
+            y = torch.clip(y, -n_levels//2, n_levels//2-1)
+            return y
+
+        @staticmethod
+        @parse_args('v','v','i','i')
+        def symbolic(g, x, weight, D, n_levels):
+
+            return g.op("PACTOps::iRMSNorm", x, weight, D_i=D, n_levels_i=n_levels)
+
+
+    def __init__(self, n_levels: int = 256, eps_in : float = 1., maxval: float = 1., weight : torch.Tensor = torch.Tensor((1.,)), D=2**24, export_node=False, **kwargs):
+        super().__init__()
+
+        self.n_levels = torch.Tensor((n_levels,)).detach()
+
+        self.eps = torch.Tensor((eps_in,)).detach()
+        self.D = torch.Tensor((D,)).detach()
+
+        # dummyOne and dummyZero are there to have a comparison value on Multi-GPU systems to check if weight are used
+
+        self.floor = torch.Tensor((False,)).detach()
+        self.clip_gradient = torch.Tensor((True,)).detach()
+        self.noisy = torch.Tensor((False,)).detach()
+
+        # Maxval is used to track statistics
+        self.maxval = torch.Tensor((maxval,)).detach()
+
+        dummyOne =  torch.Tensor((1.,)).type_as(weight)
+
+        self.export_node = export_node
+
+        if not torch.equal(weight, dummyOne):
+            clip_lo = -torch.max(torch.abs(weight))
+            clip_hi = AlmostSymmQuantFunc.apply(clip_lo, n_levels)
+
+            eps_weights = (clip_hi-clip_lo)/(n_levels-1)
+
+            self.eps_weights =  eps_weights.detach()
+
+            self.register_buffer("weight", torch.Tensor(torch.round(PACTQuantize(weight, eps_weights, clip_lo, clip_hi, self.floor, self.clip_gradient, self.noisy) / eps_weights ).detach()))
+            self.register_buffer("totScaler", torch.Tensor((torch.round(self.D * (n_levels//2-1)/maxval * eps_weights ),)).detach())
+
+            self.weight *= self.totScaler
+
+        else:
+            self.register_buffer("totScaler",torch.Tensor((torch.round(self.D * (n_levels//2-1)/maxval ),)).detach())
+            self.register_buffer("weight",self.totScaler.clone().detach())
+
+    def forward(self, x):
+        if self.export_node:
+            return self.MyRMSNorm.apply(x, self.weight.type_as(x), int(self.D.item()), int(self.n_levels.item()))
+        else:
+            return self.MyRMSNorm.forward(None, x, self.weight.type_as(x), self.D.type_as(x), self.n_levels.type_as(x))
 
 class PACTRMSNorm(_PACTEps, _PACTLinOp):
 
@@ -3540,7 +3708,8 @@ class PACTTrueIntegerDiv(nn.Module):
 
         @staticmethod
         def forward(ctx, x, y, Delta, eps, eta):
-            return x * np.trunc((Delta * eta / (y*eta + eps)))
+            # return x * np.trunc((Delta * eta / (y*eta + eps))) # OBSOLETE
+            return torch.floor((x * Delta * eta / (y*eta + eps)) + 0.5)
 
         @staticmethod
         @parse_args('v','i','i', 'i', 'i')

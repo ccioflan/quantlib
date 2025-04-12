@@ -931,6 +931,7 @@ class HomogeneousFakeQuantReluPass(SequentialPass):
                                                             symbolic_trace,
                                                             lambda x,y : PACTUnsignedAct(**pactActConfig),
                                                             f'PACTIFIED_RELU6'))
+
         super().__init__(*passes, name_prefix='')
 
 class HomogeneousFakeQuantPass(SequentialPass):
@@ -950,4 +951,3 @@ class MasksoftmaxReplacementPass(SequentialPass):
         print("in masksoftmax replacementpass")
         passes = []
         passes.append(ReplaceSequentialPatternPass(nn.Sequential(masksoftmax()), symbolic_trace, masksoftmax_replacement_fun, f'PACTIFIED_MASKSOFTMAX'))
-        super().__init__(*passes, name_prefix='')

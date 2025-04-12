@@ -77,8 +77,7 @@ class ApproximateGLUPass(SequentialPass):
 class ApproximateSiLUPass(SequentialPass):
     def __init__(self, symbolic_trace: Callable[[Union[nn.Module, fx.GraphModule]], fx.GraphModule] = PACT_symbolic_trace, n_levels: int = 255, **kwargs):
         passes = []
-        # print(f"In ApproximateSiLUPass, n_levels = {n_levels}")
-        # exit()
+
         pattern = nn.Sequential(nn.SiLU())
         passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, lambda x,y: PACTHardswish(eps_s=1/n_levels), f'_APPROXIMATE_SILU_PASS'))
         super().__init__(*passes, name_prefix='_APPROXIMATE_SILU_PASS')
