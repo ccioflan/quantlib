@@ -1445,7 +1445,7 @@ class PACTLinear(nn.Linear, _PACTLinOp):
 
     @classmethod
     def from_linear(cls, l : nn.Linear, **kwargs):
-        pact_linear = cls(l, in_features=l.in_features,
+        pact_linear = cls(in_features=l.in_features,
                           out_features=l.out_features,
                           bias=(l.bias is not None),
                           **kwargs)
