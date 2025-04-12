@@ -54,8 +54,14 @@ __all__ = ['IntegerizePACTConvPass',
            'IntegerizeGELUPass',
            'IntegerizeLayerNormPass',
            'IntegerizeEmbeddingsPass',
+           'IntegerizeTrueDivPass',
+           'IntegerizeMeanPass',
+           'IntegerizeConstWrapPass',
+           'TernarizeConvBNActPass',
+           'SwapMaxPoolActPass',
            'FixChannelNumbersPass',
            'IntegerizeBNPACTHardActsPass',
+           'ReplacePACTCausalConv1DPass',
            'PACTTracer',
            'PACT_symbolic_trace',
            'PACTIntegerHardGLU',
@@ -78,7 +84,7 @@ def integerize_softmax_fun(gm : fx.GraphModule, match : Match, mode: Literal["I-
     elif mode=='ITA':
         new_softmax = PACTIntegerITAMax(max_value = module.act.max, n_levels=module.n_levels, eps_in=eps_in, D=D, export_node=export_node)
     elif mode=='ITA-Partial':
-        new_softmax = PACTIntegerITAPartialMax(max_value = module.act.max, n_levels=module.n_levels, eps_in=eps_in, D=D, export_node=export_node)
+        new_softmax = PACTIntegerITAPartialMax(max_value = module.act.max, n_levels=module.n_levels, eps_in=eps_in, eps_max_factor = module.eps_max_factor, max_estimation=module.max_estimation, D=D, export_node=export_node)
     else:
         assert False, f"[ApproximateSoftmaxPass] Invalid mode {mode} specified!"
 
@@ -285,6 +291,7 @@ class IntegerizeSoftmaxPass(SequentialPass):
         passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, partial(integerize_softmax_fun, mode='ITA', D=D, export_node=export_softmax_node), f'_INTEGER_SOFTMAX_PASS'))
 
         pattern = nn.Sequential(PACTITAPartialMax())
+        # WIESEP: D should be small enough to cause mult of the RQS node to be in range of int8
         passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, partial(integerize_softmax_fun, mode='ITA-Partial', D=D, export_node=export_softmax_node), f'_INTEGER_SOFTMAX_PASS'))
         super().__init__(*passes, name_prefix='_INTEGER_SOFTMAX_PASS')
 
@@ -362,26 +369,19 @@ def integerize_pact_linear_fun(gm : fx.GraphModule, match : Match):
     assert isinstance(lin, PACTLinear), f"integerize_pact_linear_fun got bad match - expected PACTLinear, got {type(lin)}"
     # note the new node's intended integer precision in the precision dict
     #if prec_dict is not None:
-        #nbits = int(np.log2(lin.n_levels) + 0.2)
-        #        prec_dict[name] = nbits
+    #nbits = int(np.log2(lin.n_levels) + 0.2)
+    #        prec_dict[name] = nbits
 
     #import IPython; IPython.embed()
     new_lin = nn.Linear(in_features=lin.in_features,
                         out_features=lin.out_features,
-                        #bias=(lin.bias is not None))
-                        bias=True)
-
+                        bias=(lin.bias is not None))
     new_lin.weight.data.copy_(lin.weight_int.round())
     if lin.bias is not None:
         new_bias = lin.get_bias_int(eps_in).round()
         if len(new_bias.shape) == 2:
             new_bias = torch.diagonal(new_bias,0,dim1=-2, dim2=-1)
         new_lin.bias.data.copy_(new_bias)
-    else:
-        # this is done to avoid the inference of "MatMul" nodes during export.
-        # Those nodes do not preserve weight names and our annotation does not
-        # work for them.
-        new_lin.bias.data.zero_()
 
 
     new_lin.n_levels = lin.n_levels
@@ -466,8 +466,15 @@ class ReplacePACTCausalConv1DPass(ReplaceSequentialPatternPass):
         super(ReplacePACTCausalConv1DPass, self).__init__(pattern, symbolic_trace, replace_pact_causalconv1d_padconv1d_fun, name)
 
 
-def bn_act_to_requant_fun(gm : fx.GraphModule, match : Match, D=2**24, cmsis_requant=False, requant_node=False, skip_identity_rqs=True):
+def bn_act_to_requant_fun(gm: fx.GraphModule,
+                          match: Match,
+                          D = 2**24,
+                          recenter_act=False,
+                          cmsis_requant = False,
+                          requant_node = False,
+                          skip_identity_rqs = True):
     modules = dict(gm.named_modules())
+    alpha_h = 1.5
     if not isinstance(D, torch.Tensor):
         D = torch.tensor(D)
     matched_nodes = [n for n in match.nodes_map.values()][-2:0:-1]
@@ -483,8 +490,10 @@ def bn_act_to_requant_fun(gm : fx.GraphModule, match : Match, D=2**24, cmsis_req
         act_node = matched_nodes[1]
         bn = matched_modules[0]
         bn_node = matched_nodes[0]
-        assert isinstance(bn, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)), f"bn_act_to_requant called on incompatible BN layer {type(bn)}"
-    assert isinstance(act, (PACTUnsignedAct, PACTAsymmetricAct)), f"bn_act_to_requant called on incompatible activation {type(act)}"
+        assert isinstance(bn, (nn.BatchNorm1d, nn.BatchNorm2d,
+                               nn.BatchNorm3d)), f"bn_act_to_requant called on incompatible BN layer {type(bn)}"
+    assert isinstance(
+        act, (PACTUnsignedAct, PACTAsymmetricAct)), f"bn_act_to_requant called on incompatible activation {type(act)}"
 
     signed_act = isinstance(act, PACTAsymmetricAct)
     eps_in = extract_eps(act_node.meta['quant'].eps_in).cpu().clone().detach().squeeze()
@@ -494,8 +503,14 @@ def bn_act_to_requant_fun(gm : fx.GraphModule, match : Match, D=2**24, cmsis_req
     if skip_identity_rqs and (eps_in.numel() == eps_out.numel() == 1 and eps_in == eps_out and bn is None):
         return None
 
-    gamma_h = (bn.weight/torch.sqrt(bn.running_var+bn.eps)) if bn is not None else torch.ones_like(eps_in)
-    beta_h = bn.bias - bn.running_mean * gamma_h if bn is not None else torch.zeros_like(gamma_h)
+    gamma_h = torch.ones_like(eps_in)
+    beta_h =  torch.zeros_like(gamma_h)
+    if bn is not None:
+        gamma_h = (bn.weight / torch.sqrt(bn.running_var + bn.eps))
+        beta_h = bn.bias - bn.running_mean * gamma_h
+    elif recenter_act:
+        beta_h = -(act.clip_hi + act.clip_lo)/2
+
     gamma_h *= eps_in
     gamma_h /= eps_out
     beta_h /= eps_out
@@ -534,21 +549,27 @@ def bn_act_to_requant_fun(gm : fx.GraphModule, match : Match, D=2**24, cmsis_req
             gamma_h = gamma_h.reshape((gamma_h.numel(), 1, 1, 1))
             beta_h = beta_h.reshape((beta_h.numel(), 1, 1, 1))
 
-    requant = RequantShift(gamma_h, beta_h, act.n_levels, signed_act, D, cmsis_requant=cmsis_requant, requant_node=requant_node)
+    requant = RequantShift(gamma_h,
+                           beta_h,
+                           act.n_levels,
+                           signed_act,
+                           D,
+                           cmsis_requant = cmsis_requant,
+                           requant_node = requant_node)
     return requant
 
 class IntegerizeBNActPass(SequentialPass):
-    def __init__(self, D : float = 2**24, cmsis_requant=False, requant_node=False, skip_identity_rqs=True, symbolic_trace: callable = PACT_symbolic_trace,):
+    def __init__(self, D : float = 2**24, recenter_act=False, cmsis_requant=False, requant_node=False, skip_identity_rqs=True, symbolic_trace: callable = PACT_symbolic_trace,):
         passes = []
         # replace all combinations of BN + PACT activation with RequantShift layers
         for act_name, act_type in [("UNSIGNED_ACT", PACTUnsignedAct), ("SIGNED_ACT", PACTAsymmetricAct)]:
             for bn_name, bn_type in [("BN1D", nn.BatchNorm1d), ("BN2D", nn.BatchNorm2d), ("BN3D", nn.BatchNorm3d)]:
                 pattern = nn.Sequential(bn_type(1), act_type(n_levels=256, init_clip='max', learn_clip=False, act_kind='identity'))
-                passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, bn_act_to_requant_fun, f"_INTEGERIZE_{bn_name}_{act_name}_PASS", D=D, cmsis_requant=cmsis_requant, requant_node=requant_node, skip_identity_rqs=skip_identity_rqs))
+                passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, bn_act_to_requant_fun, f"_INTEGERIZE_{bn_name}_{act_name}_PASS", D=D, recenter_act=recenter_act, cmsis_requant=cmsis_requant, requant_node=requant_node, skip_identity_rqs=skip_identity_rqs))
 
             #also replace "freestanding" activations AFTER replacing the BN+Act stacks
             pattern = nn.Sequential(act_type(n_levels=256, init_clip='max', learn_clip=False, act_kind='identity'))
-            passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, bn_act_to_requant_fun, f"_INTEGERIZE_{act_name}_PASS", D=D, cmsis_requant=cmsis_requant, requant_node=requant_node, skip_identity_rqs=skip_identity_rqs))
+            passes.append(ReplaceSequentialPatternPass(pattern, symbolic_trace, bn_act_to_requant_fun, f"_INTEGERIZE_{act_name}_PASS", D=D, recenter_act=recenter_act, cmsis_requant=cmsis_requant, requant_node=requant_node, skip_identity_rqs=skip_identity_rqs))
 
         super(IntegerizeBNActPass, self).__init__(*passes, name_prefix="_INTEGERIZE_BN_ACT_PASS")
 
@@ -786,7 +807,7 @@ class FixChannelNumbersPass(FxPass):
         elif node.op != 'placeholder' and node not in self.visited_nodes:
             self.visited_nodes.add(node)
             for inp in node.all_input_nodes:
-                    self.fix_conv_channels(gm, inp, force_out_channels)
+                self.fix_conv_channels(gm, inp, force_out_channels)
 
     def run_pass(self, gm : fx.GraphModule):
         out_nodes = [n for n in gm.graph.nodes if n.op == 'output']
@@ -904,11 +925,11 @@ class IntegerizeBNPACTHardActsPass(SequentialPass):
                     gamma_h = gamma_h.reshape((gamma_h.numel(),))
                     beta_h = beta_h.reshape((beta_h.numel(),))
             elif isinstance(bn, nn.BatchNorm2d):
-                    gamma_h = gamma_h.reshape((gamma_h.numel(), 1, 1))
-                    beta_h = beta_h.reshape((beta_h.numel(), 1, 1))
+                gamma_h = gamma_h.reshape((gamma_h.numel(), 1, 1))
+                beta_h = beta_h.reshape((beta_h.numel(), 1, 1))
             elif isinstance(bn, nn.BatchNorm3d):
-                    gamma_h = gamma_h.reshape((gamma_h.numel(), 1, 1, 1))
-                    beta_h = beta_h.reshape((beta_h.numel(), 1, 1, 1))
+                gamma_h = gamma_h.reshape((gamma_h.numel(), 1, 1, 1))
+                beta_h = beta_h.reshape((beta_h.numel(), 1, 1, 1))
         #TODO add bias functionality for asymmetric activations
         if signed_act:
             clip_bound = np.floor(q_act.n_levels/2 + 0.01)
@@ -991,11 +1012,11 @@ class IntegerizePACTNetPass(SequentialPass):
         # with epsilons annotated everywhere, we can integerize linear
         # functions (conv and FC)
         if ternarize:
-        # Look for Conv-BN-Acts, integerize the Conv and and replace the BN-Act
-        # with Threshold layers
+            # Look for Conv-BN-Acts, integerize the Conv and and replace the BN-Act
+            # with Threshold layers
             passes.append(TernarizeConvBNActPass(symbolic_trace=symbolic_trace))
         else:
-        # simply integerize PACTConvs' convolutional weights
+            # simply integerize PACTConvs' convolutional weights
             passes.append(IntegerizePACTConvPass(symbolic_trace=symbolic_trace))
         passes.append(IntegerizePACTLinearPass(symbolic_trace=symbolic_trace))
         #passes.append(IntegerizeBNPACTHardActsPass(D1=D1, D2=D2, symbolic_trace=symbolic_trace))

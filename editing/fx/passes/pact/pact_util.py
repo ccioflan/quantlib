@@ -68,6 +68,7 @@ PACT_OPS = set([_PACTActivation,
 
 #TODO is this still reasonable??
 PACT_OPS_INT = set([PACTIntegerAdd,
+                    PACTIntegerAddMask,
                     PACTIntegerConcat,
                     PACTIntegerMatmul,
                     PACTIntegerEmbedding])

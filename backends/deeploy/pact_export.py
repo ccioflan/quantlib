@@ -26,6 +26,8 @@ from functools import partial
 from pathlib import Path
 import numpy as np
 
+from typing import List, Union
+
 import torch
 from torch import nn
 
@@ -50,6 +52,7 @@ class OptimizationConfig:
     enable_gelu: bool = True
     enable_layer_norm: bool = True
     enable_attention: bool = True
+    enable_rotary_embeddings: bool = True
     enable_skip_layer_norm: bool = False
     enable_embed_layer_norm: bool = False
     enable_bias_skip_layer_norm: bool = False
@@ -116,6 +119,9 @@ def save_beautiful_text(t: np.ndarray, layer_name: str, filepath: str):
     with open(str(filepath), 'w') as fp:
         fp.write(f"# {layer_name} (shape {list(t.shape)}),\n")
 
+        if t.ndim > 4:
+            t = t.reshape(t.shape[0], t.shape[1], t.shape[2], -1)
+
         if t.ndim == 3:
             t = t.reshape(1, t.shape[0], t.shape[1], t.shape[2])
         elif t.ndim == 2:
@@ -148,6 +154,19 @@ def save_beautiful_text(t: np.ndarray, layer_name: str, filepath: str):
                 if t.ndim >= 3: fp.write("]\n")
             if t.ndim >= 4: fp.write("]\n")
 
+def flattenOutput(inList: List[Union[torch.Tensor, List[torch.Tensor]]]) -> List[torch.Tensor]:
+
+    _list = []
+
+    for inp in inList:
+        if isinstance(inp, torch.Tensor):
+            _list.append(inp)
+        else:
+            _list += flattenOutput(inp)
+
+    return _list
+
+
 def export_net(net: nn.Module,
                name: str,
                out_dir: str,
@@ -157,6 +176,7 @@ def export_net(net: nn.Module,
                n_levels_in=256,
                D: float = 2**24,
                opset_version: int = 10,
+               onnx_shape_inference = False,
                code_size=0):
     net = net.eval()
 
@@ -178,7 +198,11 @@ def export_net(net: nn.Module,
             export_softmax_node = True,
             export_gelu_node = True,
             export_div_node = True)
+            
         net_integerized = int_pass(net_traced)
+        print("[QuantLab] === Integer PyTorch Network ===")
+        print(net_integerized.modules)
+        net_integerized.graph.print_tabular()
     else:
         net_integerized = net
 
@@ -193,7 +217,7 @@ def export_net(net: nn.Module,
                            str(onnx_path),
                            opset_version=opset_version,
                            custom_opsets={"PACTOps": 1},
-                           onnx_shape_inference=False,
+                           onnx_shape_inference=onnx_shape_inference,
                            verbose=False,
                            keep_initializers_as_inputs = False,
                            **kwargs)
@@ -215,17 +239,29 @@ def export_net(net: nn.Module,
     else:
         # # For pytorch >= 1.13 preserves the original scope names with some changes
         # # Replace "/" characters
+        def replace_name(name: str):
+            return name.replace("/", "_").replace("onnx::", "").replace(":", "_")
+
         for n in onnxModel.graph.node:
-            n.name = n.name.replace("/", "_")
+            n.name = replace_name(n.name)
 
             for i, name in enumerate(n.input):
-                n.input[i] = name.replace("/", "_")
+                n.input[i] = replace_name(name)
 
             for i, name in enumerate(n.output):
-                n.output[i] = name.replace("/", "_")
+                n.output[i] = replace_name(name)
+
+        for i, inp in enumerate(onnxModel.graph.input):
+            onnxModel.graph.input[i].name = replace_name(inp.name)
+
+        for i, outp in enumerate(onnxModel.graph.output):
+            onnxModel.graph.output[i].name = replace_name(outp.name)
 
         for i, info in enumerate(onnxModel.graph.value_info):
-            onnxModel.graph.value_info[i].name = info.name.replace("/", "_")
+            onnxModel.graph.value_info[i].name = replace_name(info.name)
+
+        for i, init in enumerate(onnxModel.graph.initializer):
+            onnxModel.graph.initializer[i].name = replace_name(init.name)
 
 
     # Replace custom nodes with standard ones for optimization
@@ -312,6 +348,7 @@ def export_net(net: nn.Module,
             n.module.register_forward_hook(hook)
 
     # Open the supplied input image
+
     if in_data is not None:
 
         net_integerized = net_integerized.to(dtype=torch.float64)
@@ -319,7 +356,7 @@ def export_net(net: nn.Module,
         if isinstance(in_data, torch.Tensor):
             input = in_data.clone().to(dtype=torch.float64)
             input_np = [torch.round(input.detach()).numpy().astype(np.int64)]
-            _output = net_integerized(input).to(dtype=torch.float64)
+            _output = net_integerized(input)
         else:
             input = [t.clone().to(dtype=torch.float64) for t in in_data]
             input_np = [torch.round(t.detach()).numpy().astype(np.int64) for t in input]
@@ -330,7 +367,8 @@ def export_net(net: nn.Module,
             output = _output
             output_np = [torch.round(output.detach()).numpy().astype(np.int64)]
         else:
-            output = [t.to(dtype=torch.float64) for t in _output if isinstance(t, torch.Tensor)]
+            output = flattenOutput(_output)
+            output = [t.to(dtype=torch.float64) for t in output if isinstance(t, torch.Tensor)]
             output_np = [torch.round(t.detach()).numpy().astype(np.int64) for t in output]
 
         inputkwargs = {}
@@ -351,7 +389,7 @@ def export_net(net: nn.Module,
 
         out_path.joinpath("activations/").mkdir(parents=True, exist_ok=True)
 
-        for idx, array in enumerate(output_np):
+        for idx, array in enumerate(input_np):
             save_beautiful_text(array, f"input_{idx}", out_path.joinpath(f"activations/input_{idx}.txt"))
         for idx, array in enumerate(output_np):
             save_beautiful_text(array, f"output_{idx}", out_path.joinpath(f"activations/output_{idx}.txt"))

@@ -44,42 +44,37 @@ import operator
 __all__ = ['AnnotateEpsPass',
            'extract_eps']
 
-def eps_conversion_pact_linears(m : nn.Module, eps_in : torch.Tensor):
+def eps_conversion_pact_linears(m : nn.Module, eps_in : torch.Tensor, **kwargs):
     ret = m.get_eps_out(eps_in).type_as(eps_in)
     return ret
 
 
-def eps_conversion_pact_acts(m : nn.Module, eps_in : torch.Tensor):
+def eps_conversion_pact_acts(m : nn.Module, eps_in : torch.Tensor, **kwargs):
     return m.get_eps().type_as(eps_in)
 
 def eps_conversion_invalid(m : nn.Module, *eps_in : torch.Tensor, **kw_eps_in : torch.Tensor):
     return torch.tensor([1.0])
     # assert False, f"Module class: {type(m)} does not have a valid epsilon conversion!"
 
-def eps_conversion_pact_gelu(m : nn.Module, eps_in : torch.Tensor):
+def eps_conversion_pact_gelu(m : nn.Module, eps_in : torch.Tensor, **kwargs):
     return m.get_eps_out(eps_in).type_as(eps_in)
 
-def eps_conversion_pact_matmul(m : nn.Module, *eps_ins):
+def eps_conversion_pact_matmul(m : nn.Module, *eps_ins, **kwargs):
     return eps_ins[0] * eps_ins[1].type_as(eps_ins[0])
 
-def eps_conversion_mul(m : nn.Module, *eps_in):
-    print (eps_in)
-    # return eps_in[0] * eps_in[1].type_as(eps_in[0]) # ORIGINAL
-    return eps_in[0] * eps_in[0].type_as(eps_in[0])
-
-def eps_conversion_matmul(*eps_ins):
+def eps_conversion_matmul(m : nn.Module, *eps_ins, **kwargs):
     return eps_ins[0] * eps_ins[1].type_as(eps_ins[0])
 
-def eps_conversion_pact_softmax(m : nn.Module, eps_in : torch.Tensor):
+def eps_conversion_pact_softmax(m : nn.Module, eps_in : torch.Tensor, **kwargs):
     return torch.Tensor((1./(m.n_levels-1.),)).type_as(eps_in)
 
 def eps_conversion_pact_masksoftmax(m : nn.Module, *eps_ins, **kwargs):
     return torch.Tensor((1./(m.n_levels-1.),)).type_as(eps_ins[0])
 
-def eps_conversion_pact_layernorm(m : nn.Module, eps_in : torch.Tensor):
+def eps_conversion_pact_layernorm(m : nn.Module, eps_in : torch.Tensor, **kwargs):
     return m.get_eps_out(eps_in).type_as(eps_in)
 
-def eps_conversion_identity(*eps_ins):
+def eps_conversion_identity(m : nn.Module, *eps_ins, **kwargs):
     return eps_ins[0]
 
 def eps_conversion_truediv(m : nn.Module, *eps_ins, **kwargs):
@@ -100,7 +95,7 @@ def eps_conversion_pact_constwrap(m : nn.Module, *eps_ins, **kwargs):
 def eps_conversion_pact_integeradd(m : nn.Module, *eps_ins, **kwargs):
     return m.act_out.get_eps().type_as(eps_ins[0])
 
-def eps_conversion_embedding(m : nn.Module, eps_in : torch.Tensor):
+def eps_conversion_embedding(m : nn.Module, eps_in : torch.Tensor, **kwargs):
     return m.adder.act_out.get_eps().type_as(eps_in)
 
 def eps_conversion_PACTWrapModule(m : nn.Module, *eps_in):
@@ -109,10 +104,10 @@ def eps_conversion_PACTWrapModule(m : nn.Module, *eps_in):
     else:
         return eps_in[0]
 
-def eps_conversion_matmul(*eps_ins):
-    return eps_ins[0] * eps_ins[1].type_as(eps_ins[0])
+def eps_conversion_mul(m : nn.Module, *eps_in, **kwargs):
+    return eps_in[0] * eps_in[1].type_as(eps_in[0])
 
-def eps_conversion_first_in(m : nn.Module, *eps_in):
+def eps_conversion_first_in(m : nn.Module, *eps_in, **kwargs):
     if len(eps_in) > 0:
         return eps_in[0]
     return eps_in
@@ -140,7 +135,7 @@ _EPS_CONVERSIONS = {
     nn.BatchNorm1d: eps_conversion_first_in,
     nn.BatchNorm2d: eps_conversion_first_in,
 
-    Multiply : eps_conversion_mul,
+    Multiply : eps_conversion_mul, # DEBUG: Is this what breaks the flow???
 
     PACTAsymmetricAct : eps_conversion_pact_acts,
     PACTConstWrap: eps_conversion_pact_constwrap,
@@ -196,6 +191,9 @@ def n_levels_out_pact_acts(m : nn.Module, in_levels : list, accumulator_levels :
 def n_levels_out_pact_embedding(m : nn.Module, in_levels : list, accumulator_levels : int = 2**32):
     return m.adder.act_out.n_levels
 
+def n_levels_out_pact_addmask(m : nn.Module, in_levels : list, accumulator_levels : int = 2**32):
+    return in_levels[1]
+
 
 _N_LEVELS_OUT_PROP = {
     '_CALL_METHOD_contiguous' : n_levels_out_first_in,
@@ -239,6 +237,7 @@ _N_LEVELS_OUT_PROP = {
     PACTIntegerLayerNorm: n_levels_out_pact_acts,
     PACTIntegerMatmul : n_levels_out_pact_linears,
     PACTIntegerSoftmax : n_levels_out_pact_acts,
+    PACTIntegerAddMask: n_levels_out_pact_addmask,
 }
 
 always_signed = lambda m, si: True
@@ -325,9 +324,13 @@ class QuantInfo:
     signed_out : bool
 
 class AnnotateEpsPass(FxPass):
-    def __init__(self, eps_in : Optional[Union[torch.Tensor, float]], n_levels_in : Optional[int] = 256, accumulator_levels : int = 2**32, signed_in : bool = True, prop_eps : bool = True, prop_n_levels : bool = True, prop_sign : bool = True, verbose=False):
+    def __init__(self, eps_in : Optional[Union[torch.Tensor, float]], n_levels_in : Optional[int] = 256, accumulator_levels : int = 2**32, signed_in : bool = True, prop_eps : bool = True, prop_n_levels : bool = True, prop_sign : bool = True, verbose=False, eps_prop_funcs = _EPS_CONVERSIONS, n_levels_prop_funcs = _N_LEVELS_OUT_PROP, signed_prop_funcs = _SIGNED_OUT_PROP):
         super(AnnotateEpsPass, self).__init__()
         self.verbose = verbose
+
+        self._EPS_CONVERSIONS = eps_prop_funcs
+        self._N_LEVELS_OUT_PROP = n_levels_prop_funcs
+        self._SIGNED_OUT_PROP = signed_prop_funcs
 
         if isinstance(eps_in, Iterable):
             try:
@@ -405,13 +408,12 @@ class AnnotateEpsPass(FxPass):
                     m = None
 
                 if self.prop_eps:
-                    # print(f"{node.name}, {node.op}, {node.target}")
-                    arg_eps_ins = [i.meta['quant'].eps_out for i in node.args if isinstance(i, fx.Node)]
-                    # if k == f'_CALL_FUNCTION_{repr(operator.getitem)}':
-                    #     print(f"getiitem arg_eps_ins is : {arg_eps_ins}")
-                    #     for i in node.args:
-                    #         print(f"Node arg : {i}")
-                    other_args = [i for i in node.args if not isinstance(i, fx.Node)]
+                    if isinstance(node.args[0], fx.immutable_collections.immutable_list):
+                        arg_eps_ins = [i.meta['quant'].eps_out for i in node.args[0] if isinstance(i, fx.Node)]
+                        other_args = [i for i in node.args[0] if not isinstance(i, fx.Node)]
+                    else:
+                        arg_eps_ins = [i.meta['quant'].eps_out for i in node.args if isinstance(i, fx.Node)]
+                        other_args = [i for i in node.args if not isinstance(i, fx.Node)]
 
                     kwarg_eps_ins = {k : v.meta['quant'].eps_out for k, v in node.kwargs.items() if isinstance(v, fx.Node)}
                     other_kwargs = {k : v for k, v in node.kwargs.items() if not isinstance(v, fx.Node)}
@@ -422,33 +424,11 @@ class AnnotateEpsPass(FxPass):
                     if node.op == 'call_module':
                         conversion_args = [m] + arg_eps_ins + other_args
                     else:
-                        conversion_args = arg_eps_ins
+                        conversion_args = [None] + arg_eps_ins
 
                     try:
-                        # print(f"Key: {k}")
-                        
-                        # print("Conversion args")
-                        # print(conversion_args)
-                        # print(conversion_kwargs)
-                        # for val in arg_eps_ins:
-                        #     print(val.shape)
-                        
-                        if k == PACTDiv:
-                            # print(conversion_args)
-                            # constant value as second parameter of div
-                            # set eps 1.0
-                            # print("in div eps conversion")
-                            # print()
-                            if(type(other_args[0]) == int):
-                                conversion_args = [m] + arg_eps_ins + [torch.tensor(1.0)]
-                                # print(conversion_args)
-                        # if k == PACTDiv:
-                        #     print(len(conversion_args))
-                        eps_out = _EPS_CONVERSIONS[k](*conversion_args, **conversion_kwargs)
-                        # if k == f'_CALL_FUNCTION_{repr(operator.getitem)}':
-                        #     print(f"getiitem eps_out is : {eps_out}")
-                        #     print(f"getitem conversion_args : {conversion_args}")
-                        #     print(f"getitem conversion_kwargs : {conversion_kwargs}")
+                        eps_out = self._EPS_CONVERSIONS[k](*conversion_args, **conversion_kwargs)
+
                     except KeyError:
                         if (self.verbose):
                             print(f"[AnnotateEpsPass] Key {k} not found in _EPS_CONVERSIONS!")
@@ -474,9 +454,12 @@ class AnnotateEpsPass(FxPass):
                     eps_out = None
 
                 if self.prop_n_levels:
-                    node_in_levels = [i.meta['quant'].n_levels_out for i in node.args if isinstance(i, fx.Node)]
+                    if isinstance(node.args[0], fx.immutable_collections.immutable_list):
+                        node_in_levels = [i.meta['quant'].n_levels_out for i in node.args[0] if isinstance(i, fx.Node)]
+                    else:
+                        node_in_levels = [i.meta['quant'].n_levels_out for i in node.args if isinstance(i, fx.Node)]
                     try:
-                        node_out_levels = _N_LEVELS_OUT_PROP[k](m, node_in_levels, self.accumulator_levels)
+                        node_out_levels = self._N_LEVELS_OUT_PROP[k](m, node_in_levels, self.accumulator_levels)
                     except KeyError:
                         if (self.verbose):
                             print(f"[AnnotateEpsPass] Key {k} not found in _N_LEVELS_OUT_PROP!")
@@ -495,10 +478,12 @@ class AnnotateEpsPass(FxPass):
                     node_out_levels = None
 
                 if self.prop_sign:
-
-                    node_in_signed = [i.meta['quant'].signed_out for i in node.args if isinstance(i, fx.Node)]
+                    if isinstance(node.args[0], fx.immutable_collections.immutable_list):
+                        node_in_signed = [i.meta['quant'].signed_out for i in node.args[0] if isinstance(i, fx.Node)]
+                    else:
+                        node_in_signed = [i.meta['quant'].signed_out for i in node.args if isinstance(i, fx.Node)]
                     try:
-                        node_out_signed = _SIGNED_OUT_PROP[k](m, node_in_signed)
+                        node_out_signed = self._SIGNED_OUT_PROP[k](m, node_in_signed)
                     except KeyError:
                         if (self.verbose):
                             print(f"[AnnotateEpsPass] Key {k} not found in _SIGNED_OUT_PROP!")

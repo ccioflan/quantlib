@@ -46,11 +46,7 @@ class SequentialMatcher:
         self.searched_gm : fx.GraphModule = None
 
         self.pattern = pattern
-
-        # print("in sequential matcher, pattern is", pattern)
-        # print(f"pattern graph has {len(self.p.graph.nodes)} nodes")
-        # print(f"pattern graph is {self.p.graph.print_tabular()}")
-
+        
     @property
     def searched_modules(self):
         # a dictionary of the modules contained in the searched GraphModule
