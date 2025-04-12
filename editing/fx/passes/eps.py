@@ -429,6 +429,27 @@ class AnnotateEpsPass(FxPass):
                     try:
                         eps_out = self._EPS_CONVERSIONS[k](*conversion_args, **conversion_kwargs)
 
+                        # YIFAN
+                        # DEBUG
+                    
+                        # if k == PACTDiv:
+                        #     # print(conversion_args)
+                        #     # constant value as second parameter of div
+                        #     # set eps 1.0
+                        #     # print("in div eps conversion")
+                        #     # print()
+                        #     if(type(other_args[0]) == int):
+                        #         conversion_args = [m] + arg_eps_ins + [torch.tensor(1.0)]
+                        #         # print(conversion_args)
+                        # # if k == PACTDiv:
+                        # #     print(len(conversion_args))
+                        # eps_out = _EPS_CONVERSIONS[k](*conversion_args, **conversion_kwargs)
+                        # # if k == f'_CALL_FUNCTION_{repr(operator.getitem)}':
+                        # #     print(f"getiitem eps_out is : {eps_out}")
+                        # #     print(f"getitem conversion_args : {conversion_args}")
+                        # #     print(f"getitem conversion_kwargs : {conversion_kwargs}")
+
+
                     except KeyError:
                         if (self.verbose):
                             print(f"[AnnotateEpsPass] Key {k} not found in _EPS_CONVERSIONS!")
