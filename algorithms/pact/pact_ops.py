@@ -61,6 +61,7 @@ __all__ = [
     'IntegerSofterMax', 
     'PACTIntegerMaskSoftmax',
     'PACTIntegerHardGLU',
+    'PACTHardGLU',
     'PACTMaskSoftmax'
 ]
 
