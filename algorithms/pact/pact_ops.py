@@ -1637,8 +1637,7 @@ class PACTIntegerHardGLU(nn.Module):
     def forward(self, x):
         x_in, x_gate = x.chunk(2, dim=self.dim)
         return x_in * self._integer_hardsigmoid_forward(x_gate)
-=======
->>>>>>> devel
+
 
 class PACTHardsigmoid(nn.Module):
     def __init__(self, eps_s : float):
