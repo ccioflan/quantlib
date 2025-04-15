@@ -105,7 +105,12 @@ def eps_conversion_PACTWrapModule(m : nn.Module, *eps_in):
         return eps_in[0]
 
 def eps_conversion_mul(m : nn.Module, *eps_in, **kwargs):
-    return eps_in[0] * eps_in[1].type_as(eps_in[0])
+
+    # PATCH: EffConformer
+    if (len(eps_in) > 1):
+        return eps_in[0] * eps_in[1].type_as(eps_in[0])
+    else:
+        return eps_in[0]
 
 def eps_conversion_first_in(m : nn.Module, *eps_in, **kwargs):
     if len(eps_in) > 0:

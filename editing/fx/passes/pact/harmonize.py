@@ -946,8 +946,8 @@ class HomogeneousFakeQuantPass(SequentialPass):
         passes.append(HomogeneousFakeQuantLinearPass(linearArgs, symbolic_trace=symbolic_trace))
         super().__init__(*passes, name_prefix='')
 
-    # YIFAN
-    # DEBUG
+# YIFAN
+# DEBUG
 from quantlib.algorithms.pact.pact_ops import PACTMaskSoftmax
 def masksoftmax_replacement_fun(gm, m, **kwargs):
     return PACTMaskSoftmax()
